@@ -1,0 +1,459 @@
+import os
+import csv
+import threading
+from datetime import datetime
+import pandas as pd
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+import subprocess
+import sys
+
+from openpyxl.styles import Font, Alignment
+from openpyxl.utils import get_column_letter
+
+
+# ======================================================
+# PYINSTALLER SAFE RESOURCE PATH
+# ======================================================
+def resource_path(relative_path: str) -> str:
+    """
+    Works for:
+    - normal python run (dev)
+    - PyInstaller onefile/onedir (uses sys._MEIPASS)
+    """
+    base_path = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    return os.path.join(base_path, relative_path)
+
+
+# ======================================================
+# CONFIG
+# ======================================================
+COL_D_IDX = 3
+COL_F_IDX = 5
+
+ANODE_D = 0.06749985
+CATHODE_D = 0.08249985
+PAD_D = 26.7287966
+
+TOLERANCE = 1e-6
+
+OUTPUT_SHEET_NAME = "Xray Data"
+
+# Make the blank spacing columns wider (Column C & F)
+SPACING_WIDTH = 8  # change to 10, 12, etc if you want wider
+
+
+# ======================================================
+# HELPERS
+# ======================================================
+def list_data_files_recursive(folder: str):
+    """Recursively find all supported files inside folder + subfolders."""
+    exts = (".csv", ".xlsx", ".xlsm", ".xls")
+    found = []
+    for root, _, files in os.walk(folder):
+        for f in files:
+            if f.startswith("~$"):
+                continue
+            if f.lower().endswith(exts):
+                found.append(os.path.join(root, f))
+    return sorted(found)
+
+
+def open_folder(path: str):
+    if sys.platform == "win32":
+        subprocess.Popen(["explorer", os.path.abspath(path)])
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", os.path.abspath(path)])
+    else:
+        subprocess.Popen(["xdg-open", os.path.abspath(path)])
+
+
+def show_file(path: str):
+    path_abs = os.path.abspath(path)
+    if sys.platform == "win32":
+        subprocess.Popen(["explorer", "/select,", path_abs])
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", path_abs])
+    else:
+        open_folder(os.path.dirname(path))
+
+
+def detect_delimiter(path: str, sample_lines: int = 50):
+    candidates = [",", ";", "\t", "|"]
+    scores = {c: 0 for c in candidates}
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for _ in range(sample_lines):
+            line = f.readline()
+            if not line:
+                break
+            for c in candidates:
+                scores[c] += line.count(c)
+
+    return max(scores, key=scores.get)
+
+
+def read_csv_variable_fields(path: str) -> pd.DataFrame:
+    """
+    Read CSV with variable number of columns per row by padding to max columns.
+    Keeps all rows.
+    """
+    delim = detect_delimiter(path)
+
+    rows = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        reader = csv.reader(f, delimiter=delim)
+        for r in reader:
+            rows.append(r)
+
+    if not rows:
+        raise RuntimeError("CSV is empty.")
+
+    max_len = max(len(r) for r in rows)
+    padded = [r + [""] * (max_len - len(r)) for r in rows]
+
+    header = padded[0]
+    data = padded[1:]
+
+    header_nonempty = sum(1 for x in header if str(x).strip())
+    header_numeric_like = sum(1 for x in header if str(x).strip().replace(".", "", 1).isdigit())
+
+    if header_nonempty < max_len // 3 or header_numeric_like > max_len // 2:
+        cols = [f"COL_{i+1}" for i in range(max_len)]
+        df = pd.DataFrame(padded, columns=cols)
+    else:
+        cols = [str(c).strip() or f"COL_{i+1}" for i, c in enumerate(header)]
+        df = pd.DataFrame(data, columns=cols)
+
+    return df
+
+
+def clean_numeric_series(s: pd.Series) -> pd.Series:
+    """
+    Supports comma decimal (e.g. "0,06749985") from other PCs/Excel locale.
+    - If value contains ',' and no '.', treat ',' as decimal separator -> replace with '.'
+    - Else treat ',' as thousands separator -> remove
+    """
+    s = s.astype(str).str.strip()
+
+    mask_decimal_comma = s.str.contains(",", na=False) & ~s.str.contains(r"\.", na=False)
+    s.loc[mask_decimal_comma] = s.loc[mask_decimal_comma].str.replace(",", ".", regex=False)
+
+    s = s.str.replace(",", "", regex=False)
+    s = s.str.replace(r"[^0-9.+-Ee]", "", regex=True)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _pad_list(lst, n, fill=None):
+    if len(lst) >= n:
+        return lst
+    return lst + [fill] * (n - len(lst))
+
+
+# ======================================================
+# EXTRACTION (OUTPUT LIKE YOUR SCREENSHOT)
+# ======================================================
+def extract_all_matches_from_df(df: pd.DataFrame) -> pd.DataFrame | None:
+    """
+    Search Column D for the 3 exact values (within tolerance),
+    extract Column F from the same row.
+
+    Output format:
+    Anode | Voiding(%) | (blank) | Cathode | Voiding(%) | (blank) | MM Thermal Pad | Voiding(%)
+    """
+    if df is None or df.empty or df.shape[1] <= COL_F_IDX:
+        return None
+
+    d = clean_numeric_series(df.iloc[:, COL_D_IDX])
+    f = clean_numeric_series(df.iloc[:, COL_F_IDX])
+
+    anode_vals, anode_void = [], []
+    cath_vals, cath_void = [], []
+    pad_vals, pad_void = [], []
+
+    for i in df.index:
+        dv = d.loc[i]
+        fv = f.loc[i]
+        if pd.isna(dv) or pd.isna(fv):
+            continue
+
+        if abs(dv - ANODE_D) <= TOLERANCE:
+            anode_vals.append(dv)
+            anode_void.append(fv)
+        elif abs(dv - CATHODE_D) <= TOLERANCE:
+            cath_vals.append(dv)
+            cath_void.append(fv)
+        elif abs(dv - PAD_D) <= TOLERANCE:
+            pad_vals.append(dv)
+            pad_void.append(fv)
+
+    if not (anode_vals or cath_vals or pad_vals):
+        return None
+
+    max_len = max(len(anode_vals), len(cath_vals), len(pad_vals))
+
+    out = pd.DataFrame({
+        "Anode": _pad_list(anode_vals, max_len, None),
+        "Voiding(%)_Anode": _pad_list(anode_void, max_len, None),
+        "": [""] * max_len,  # spacing col C
+        "Cathode": _pad_list(cath_vals, max_len, None),
+        "Voiding(%)_Cathode": _pad_list(cath_void, max_len, None),
+        "  ": [""] * max_len,  # spacing col F (different key so pandas keeps both)
+        "MM Thermal Pad": _pad_list(pad_vals, max_len, None),
+        "Voiding(%)_Pad": _pad_list(pad_void, max_len, None),
+    })
+
+    return out
+
+
+def extract_file(path: str) -> pd.DataFrame | None:
+    if path.lower().endswith(".csv"):
+        return extract_all_matches_from_df(read_csv_variable_fields(path))
+
+    try:
+        xls = pd.ExcelFile(path)
+    except Exception:
+        return None
+
+    parts = []
+    for s in xls.sheet_names:
+        try:
+            p = extract_all_matches_from_df(pd.read_excel(xls, sheet_name=s))
+            if p is not None and not p.empty:
+                parts.append(p)
+        except Exception:
+            pass
+
+    return pd.concat(parts, ignore_index=True) if parts else None
+
+
+# ======================================================
+# EXCEL OUTPUT (ONE SHEET ONLY)
+# ======================================================
+def write_excel_single_sheet(df: pd.DataFrame, out_path: str):
+    df = df[[
+        "Anode", "Voiding(%)_Anode", "",
+        "Cathode", "Voiding(%)_Cathode", "  ",
+        "MM Thermal Pad", "Voiding(%)_Pad"
+    ]].copy()
+
+    df.columns = [
+        "Anode", "Voiding(%)", "",
+        "Cathode", "Voiding(%)", "",
+        "MM Thermal Pad", "Voiding(%)"
+    ]
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=OUTPUT_SHEET_NAME)
+        ws = writer.sheets[OUTPUT_SHEET_NAME]
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = None  # no filters
+
+        # header style
+        for c in range(1, 9):  # A..H
+            cell = ws.cell(row=1, column=c)
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+
+        # widths: A,B,C,D,E,F,G,H
+        widths = [14, 12, SPACING_WIDTH, 14, 12, SPACING_WIDTH, 18, 12]
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def run_paths(paths, out_folder, progress_cb, status_cb):
+    parts = []
+    total = len(paths)
+
+    for i, p in enumerate(paths, 1):
+        status_cb(f"Processing {i}/{total}: {os.path.basename(p)}")
+        r = extract_file(p)
+        if r is not None and not r.empty:
+            parts.append(r)
+        progress_cb(i, total)
+
+    if not parts:
+        raise RuntimeError("No matching data found.")
+
+    final_df = pd.concat(parts, ignore_index=True)
+    out_path = os.path.join(out_folder, f"Voiding_Results_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+    write_excel_single_sheet(final_df, out_path)
+    return out_path
+
+
+# ======================================================
+# UI (RESTORED WITH OUTPUT BUTTONS)
+# ======================================================
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("XRAY Voiding Data Extractor")
+        self.geometry("750x450")
+        ctk.set_appearance_mode("System")
+
+        # ✅ titlebar icon (optional; taskbar icon comes from PyInstaller --icon)
+        try:
+            self.iconbitmap(resource_path("xray.ico"))
+        except Exception:
+            pass
+
+        self.selected_path = ctk.StringVar(value="No input selected")
+        self.status = ctk.StringVar(value="Ready")
+        self.last_output = None
+        self.input_kind = None
+
+        main = ctk.CTkFrame(self, corner_radius=10)
+        main.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(
+            main,
+            text="XRAY Voiding Data Extractor",
+            font=ctk.CTkFont(size=26, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(20, 0))
+
+        input_frame = ctk.CTkFrame(main, corner_radius=10)
+        input_frame.pack(fill="x", padx=20, pady=20)
+        input_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        ctk.CTkLabel(
+            input_frame,
+            textvariable=self.selected_path,
+            fg_color=("#E5E7E9", "#2C2C2C"),
+            corner_radius=6,
+            anchor="w",
+            justify="left"
+        ).grid(row=0, column=0, columnspan=4, sticky="ew", padx=15, pady=15)
+
+        ctk.CTkButton(
+            input_frame, text="Select Folder", command=self.pick_folder,
+            fg_color="#3498DB", hover_color="#2E86C1"
+        ).grid(row=1, column=0, padx=(15, 5), pady=10, sticky="ew")
+
+        ctk.CTkButton(
+            input_frame, text="Select File", command=self.pick_file,
+            fg_color="#3498DB", hover_color="#2E86C1"
+        ).grid(row=1, column=1, padx=5, pady=10, sticky="ew")
+
+        self.btn_start = ctk.CTkButton(
+            input_frame, text="Start Extraction", command=self.start,
+            state="disabled", fg_color="#2ECC71", hover_color="#27AE60",
+            font=ctk.CTkFont(weight="bold")
+        )
+        self.btn_start.grid(row=1, column=2, padx=5, pady=10, sticky="ew")
+
+        ctk.CTkButton(
+            input_frame, text="Clear", command=self.clear,
+            fg_color="#E74C3C", hover_color="#C0392B",
+            font=ctk.CTkFont(weight="bold")
+        ).grid(row=1, column=3, padx=(5, 15), pady=10, sticky="ew")
+
+        self.pb = ctk.CTkProgressBar(main)
+        self.pb.pack(fill="x", padx=20, pady=(10, 0))
+        self.pb.set(0)
+
+        ctk.CTkLabel(main, textvariable=self.status).pack(anchor="w", padx=20, pady=10)
+
+        # ✅ RESTORED ACTION BUTTONS
+        action = ctk.CTkFrame(main)
+        action.pack(fill="x", padx=20, pady=10)
+
+        self.btn_open_folder = ctk.CTkButton(
+            action, text="Open Output Folder", command=self.open_out_folder,
+            state="disabled", fg_color="#95A5A6", hover_color="#7F8C8D"
+        )
+        self.btn_open_folder.pack(side="left", expand=True, padx=5)
+
+        self.btn_open_file = ctk.CTkButton(
+            action, text="Show Output File", command=self.open_out_file,
+            state="disabled", fg_color="#95A5A6", hover_color="#7F8C8D"
+        )
+        self.btn_open_file.pack(side="left", expand=True, padx=5)
+
+    def pick_folder(self):
+        p = filedialog.askdirectory()
+        if p:
+            self.selected_path.set(p)
+            self.input_kind = "folder"
+            self.btn_start.configure(state="normal")
+
+    def pick_file(self):
+        p = filedialog.askopenfilename(filetypes=[("Data files", "*.csv *.xlsx *.xlsm *.xls")])
+        if p:
+            self.selected_path.set(p)
+            self.input_kind = "file"
+            self.btn_start.configure(state="normal")
+
+    def clear(self):
+        self.selected_path.set("No input selected")
+        self.status.set("Ready")
+        self.pb.set(0)
+        self.input_kind = None
+        self.last_output = None
+        self.btn_start.configure(state="disabled")
+        self.btn_open_folder.configure(state="disabled")
+        self.btn_open_file.configure(state="disabled")
+
+    def start(self):
+        path = self.selected_path.get()
+        if not path or path == "No input selected":
+            messagebox.showerror("Error", "Please select a folder or file first.")
+            return
+
+        # Build file list
+        if self.input_kind == "folder":
+            paths = list_data_files_recursive(path)  # ✅ recursive
+            if not paths:
+                messagebox.showerror("Error", "No supported files found in the selected folder (including subfolders).")
+                return
+            out_folder = path
+        else:
+            if not os.path.exists(path):
+                messagebox.showerror("Error", "Selected file no longer exists.")
+                return
+            paths = [path]
+            out_folder = os.path.dirname(path)
+
+        self.btn_start.configure(state="disabled")
+        self.btn_open_folder.configure(state="disabled")
+        self.btn_open_file.configure(state="disabled")
+        self.pb.set(0)
+        self.status.set(f"Found {len(paths)} file(s). Running...")
+
+        def progress(done, total):
+            self.after(0, lambda: self.pb.set(done / total))
+
+        def status_cb(msg):
+            self.after(0, lambda: self.status.set(msg))
+
+        def worker():
+            try:
+                out = run_paths(paths, out_folder, progress, status_cb)
+                self.last_output = out
+                self.after(0, lambda: self.btn_open_folder.configure(state="normal"))
+                self.after(0, lambda: self.btn_open_file.configure(state="normal"))
+                self.after(0, lambda: self.status.set(f"Done: {os.path.basename(out)}"))
+                self.after(0, lambda: messagebox.showinfo("Done", f"Saved:\n{out}"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Error", str(e)))
+                self.after(0, lambda: self.status.set(f"Failed: {e}"))
+            finally:
+                self.after(0, lambda: self.btn_start.configure(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_out_folder(self):
+        if self.last_output and os.path.exists(self.last_output):
+            open_folder(os.path.dirname(self.last_output))
+        else:
+            messagebox.showinfo("Info", "No output yet. Run extraction first.")
+
+    def open_out_file(self):
+        if self.last_output and os.path.exists(self.last_output):
+            show_file(self.last_output)
+        else:
+            messagebox.showinfo("Info", "No output yet. Run extraction first.")
+
+
+if __name__ == "__main__":
+    App().mainloop()

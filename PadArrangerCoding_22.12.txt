@@ -1,0 +1,630 @@
+import os
+import re
+import io
+import sys
+import threading
+import subprocess
+from collections import defaultdict
+
+import numpy as np
+from PIL import Image
+from pptx import Presentation
+from pptx.util import Inches
+
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+
+
+# ======================================================
+# PyInstaller-safe resource path (for icon + bundled files)
+# ======================================================
+def resource_path(relative_path: str) -> str:
+    """
+    Get absolute path to resource, works for dev and for PyInstaller (--onefile/--onedir).
+    """
+    try:
+        base_path = sys._MEIPASS  # type: ignore[attr-defined]
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
+# ======================================================
+# HELPERS (Open folder)
+# ======================================================
+def open_folder(path: str):
+    path_abs = os.path.abspath(path)
+    if sys.platform == "win32":
+        subprocess.Popen(["explorer", path_abs])
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path_abs])
+    else:
+        subprocess.Popen(["xdg-open", path_abs])
+
+
+# =========================
+# Crop to real content
+# =========================
+def autocrop_to_content(img, extra=12):
+    g = np.array(img.convert("L"), dtype=np.uint8)
+    inv = 255 - g
+    thr = max(10, int(inv.mean() * 0.35))
+    mask = inv > thr
+    if mask.sum() < 50:
+        return img
+
+    ys, xs = np.nonzero(mask)
+    y0, y1 = ys.min(), ys.max()
+    x0, x1 = xs.min(), xs.max()
+
+    h, w = g.shape
+    return img.crop((
+        max(0, x0 - extra), max(0, y0 - extra),
+        min(w, x1 + extra), min(h, y1 + extra)
+    ))
+
+
+# =========================
+# Orientation helpers
+# =========================
+def rotate_to_role(img, role):
+    w, h = img.size
+    if role in ("top", "bottom") and h > w:
+        return img.rotate(90, expand=True)
+    if role in ("left", "right") and w > h:
+        return img.rotate(90, expand=True)
+    return img
+
+
+def edge_darkness(img, edge, ratio=0.18):
+    g = np.array(img.convert("L"), dtype=np.float32)
+    h, w = g.shape
+    b = max(2, int(min(h, w) * ratio))
+
+    if edge == "left":
+        r = g[:, :b]
+    elif edge == "right":
+        r = g[:, w - b: w]
+    else:
+        r = g
+
+    return float((255.0 - r).mean())
+
+
+def vertical_pin_score(img, edge="top", band_ratio=0.06, steps=6):
+    """
+    Detects strongest horizontal pin band near top or bottom.
+    This FIXES incorrect top/bottom orientation.
+    """
+    g = np.array(img.convert("L"), dtype=np.float32)
+    h, w = g.shape
+    band_h = max(2, int(h * band_ratio))
+
+    scores = []
+    for i in range(steps):
+        if edge == "top":
+            y0 = i * band_h
+        else:  # bottom
+            y0 = h - (i + 1) * band_h
+
+        y1 = min(h, y0 + band_h)
+        region = g[y0:y1, :]
+        scores.append((255.0 - region).mean())
+
+    return max(scores)
+
+
+def orient_toward_center(img, role):
+    if role == "top":
+        # inner edge = bottom
+        if vertical_pin_score(img, "top") > vertical_pin_score(img, "bottom"):
+            return img.transpose(Image.FLIP_TOP_BOTTOM)
+
+    elif role == "bottom":
+        # inner edge = top
+        if vertical_pin_score(img, "bottom") > vertical_pin_score(img, "top"):
+            return img.transpose(Image.FLIP_TOP_BOTTOM)
+
+    elif role == "left":
+        if edge_darkness(img, "left") > edge_darkness(img, "right"):
+            return img.transpose(Image.FLIP_LEFT_RIGHT)
+
+    elif role == "right":
+        if edge_darkness(img, "right") > edge_darkness(img, "left"):
+            return img.transpose(Image.FLIP_LEFT_RIGHT)
+
+    return img
+
+
+# =========================
+# Analyze image geometry
+# =========================
+def analyze(path):
+    with Image.open(path) as im:
+        im = autocrop_to_content(im.convert("RGBA"))
+        w, h = im.size
+    return {
+        "path": path,
+        "w": w,
+        "h": h,
+        "aspect": w / (h + 1e-6),
+        "area": w * h
+    }
+
+
+# =========================
+# Pick roles by shape
+# =========================
+def pick_roles(paths):
+    infos = [analyze(p) for p in paths]
+
+    # CENTER = largest + square-ish
+    center = max(infos, key=lambda x: x["area"] - abs(x["aspect"] - 1.0) * x["area"] * 0.7)
+    rest = [x for x in infos if x["path"] != center["path"]]
+
+    horizontals = [x for x in rest if x["aspect"] >= 1.15]
+    verticals = [x for x in rest if x["aspect"] <= 0.87]
+
+    horizontals.sort(key=lambda x: x["w"], reverse=True)
+    verticals.sort(key=lambda x: x["h"], reverse=True)
+
+    bottom = horizontals[0]["path"] if len(horizontals) >= 1 else None
+    top = horizontals[1]["path"] if len(horizontals) >= 2 else None
+
+    left = verticals[0]["path"] if len(verticals) >= 1 else None
+    right = verticals[1]["path"] if len(verticals) >= 2 else left
+
+    return {
+        "center": center["path"],
+        "top": top,
+        "bottom": bottom,
+        "left": left,
+        "right": right
+    }
+
+
+# =========================
+# Compose cross
+# =========================
+def compose_cross(r, pad=24, stick=0):
+    def load(p, role):
+        if not p:
+            return None
+        im = Image.open(p).convert("RGBA")
+        im = autocrop_to_content(im)
+        im = rotate_to_role(im, role)
+        im = orient_toward_center(im, role)
+        return im
+
+    c = load(r["center"], "center")
+    t = load(r["top"], "top")
+    b = load(r["bottom"], "bottom")
+    l = load(r["left"], "left")
+    rt = load(r["right"], "right")
+
+    cw, ch = c.size
+
+    if l:
+        l = l.resize((int(l.width * (ch / l.height)), ch), Image.LANCZOS)
+    if rt:
+        rt = rt.resize((int(rt.width * (ch / rt.height)), ch), Image.LANCZOS)
+    if t:
+        t = t.resize((cw, int(t.height * (cw / t.width))), Image.LANCZOS)
+    if b:
+        b = b.resize((cw, int(b.height * (cw / b.width))), Image.LANCZOS)
+
+    W = (l.width if l else 0) + cw + (rt.width if rt else 0) + pad * 2
+    H = (t.height if t else 0) + ch + (b.height if b else 0) + pad * 2
+    canvas = Image.new("RGBA", (W, H), (255, 255, 255, 255))
+
+    cx = pad + (l.width if l else 0)
+    cy = pad + (t.height if t else 0)
+
+    if t:
+        canvas.paste(t, (cx, pad), t)
+    if l:
+        canvas.paste(l, (pad, cy), l)
+
+    canvas.paste(c, (cx, cy), c)
+
+    if rt:
+        canvas.paste(rt, (cx + cw + stick, cy), rt)
+    if b:
+        canvas.paste(b, (cx, cy + ch + stick), b)
+
+    return canvas.convert("RGB")
+
+
+# =========================
+# PPT helpers
+# =========================
+def set_16x9(prs):
+    prs.slide_width = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+
+
+def add_board_id(slide, board_id):
+    tb = slide.shapes.add_textbox(Inches(0.3), Inches(0.15), Inches(8.0), Inches(0.5))
+    p = tb.text_frame.paragraphs[0]
+    p.text = board_id
+    p.font.bold = True
+    p.font.size = Inches(0.28)
+
+
+def add_centered_image(prs, slide, buf):
+    top_margin = Inches(0.65)
+    bottom_margin = Inches(0.35)
+    left_margin = Inches(0.55)
+    right_margin = Inches(0.55)
+
+    avail_w = prs.slide_width - left_margin - right_margin
+    avail_h = prs.slide_height - top_margin - bottom_margin
+
+    buf.seek(0)
+    with Image.open(buf) as im:
+        w, h = im.size
+
+    aspect = w / (h + 1e-6)
+    target_h = avail_h
+    target_w = target_h * aspect
+
+    if target_w > avail_w:
+        target_w = avail_w
+        target_h = target_w / aspect
+
+    buf.seek(0)
+    pic = slide.shapes.add_picture(buf, 0, 0, width=int(target_w), height=int(target_h))
+    pic.left = int((prs.slide_width - pic.width) / 2)
+    pic.top = int((prs.slide_height - pic.height) / 2)
+
+
+# =========================
+# Output folder helpers
+# =========================
+def safe_name(name):
+    name = name.strip().rstrip(".")
+    return re.sub(r'[\\/:*?"<>|]+', "_", name)
+
+
+def get_output_folder(selected_root):
+    """
+    Output folder named after the selected folder:
+    Documents\\PadArranger_Output\\<SelectedFolderName>\\
+    """
+    base_name = safe_name(os.path.basename(selected_root))
+    base_output = os.path.join(os.environ["USERPROFILE"], "Documents", "PadArranger_Output")
+    final_output = os.path.join(base_output, base_name)
+    os.makedirs(final_output, exist_ok=True)
+    return final_output
+
+
+# =========================
+# Montage (7-in-1) helpers
+# =========================
+def fit_size(img_w, img_h, box_w, box_h):
+    aspect = img_w / (img_h + 1e-9)
+    w = box_w
+    h = w / aspect
+    if h > box_h:
+        h = box_h
+        w = h * aspect
+    return w, h
+
+
+def add_label_under(slide, center_x, y, text, box_w=Inches(1.3)):
+    x = center_x - (box_w / 2)
+    tb = slide.shapes.add_textbox(x, y, box_w, Inches(0.35))
+    tf = tb.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    p.text = text
+    p.font.bold = True
+    p.font.size = int(18 * 12700)  # 18pt
+    p.alignment = 1  # center
+
+
+def add_montage_slide_4_3(prs, items):
+    """
+    7 items => 4 top + 3 bottom.
+    Label is centered under the center of each MM image.
+    items: list of (label, png_buffer)
+    """
+    left_m = Inches(0.4)
+    right_m = Inches(0.4)
+    top_m = Inches(0.35)
+    bottom_m = Inches(0.35)
+
+    gap_x = Inches(0.35)
+    gap_y = Inches(0.45)
+    label_h = Inches(0.35)
+    img_label_gap = Inches(0.08)
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    avail_w = prs.slide_width - left_m - right_m
+    avail_h = prs.slide_height - top_m - bottom_m
+    row_h = (avail_h - gap_y) / 2
+
+    # top row (4)
+    top_cols = 4
+    top_cell_w = (avail_w - gap_x * (top_cols - 1)) / top_cols
+    top_img_box_h = row_h - label_h - img_label_gap
+
+    # bottom row (3)
+    bot_cols = 3
+    bot_cell_w = (avail_w - gap_x * (bot_cols - 1)) / bot_cols
+    bot_img_box_h = row_h - label_h - img_label_gap
+
+    top_items = items[:4]
+    bot_items = items[4:7]
+
+    y_top = top_m
+    y_bot = top_m + row_h + gap_y
+
+    # --- top row ---
+    for i, (label, buf) in enumerate(top_items):
+        cell_x = left_m + i * (top_cell_w + gap_x)
+
+        buf.seek(0)
+        with Image.open(buf) as im:
+            iw, ih = im.size
+
+        w, h = fit_size(iw, ih, top_cell_w, top_img_box_h)
+        pic_left = cell_x + (top_cell_w - w) / 2
+        pic_top = y_top + (top_img_box_h - h) / 2
+
+        buf.seek(0)
+        slide.shapes.add_picture(buf, pic_left, pic_top, width=int(w), height=int(h))
+
+        img_center_x = pic_left + (w / 2)
+        label_y = pic_top + h + img_label_gap
+        add_label_under(slide, img_center_x, label_y, label, box_w=Inches(1.3))
+
+    # --- bottom row (centered) ---
+    if bot_items:
+        row_total_w = bot_cols * bot_cell_w + (bot_cols - 1) * gap_x
+        x0 = left_m + (avail_w - row_total_w) / 2
+
+        for i, (label, buf) in enumerate(bot_items):
+            cell_x = x0 + i * (bot_cell_w + gap_x)
+
+            buf.seek(0)
+            with Image.open(buf) as im:
+                iw, ih = im.size
+
+            w, h = fit_size(iw, ih, bot_cell_w, bot_img_box_h)
+            pic_left = cell_x + (bot_cell_w - w) / 2
+            pic_top = y_bot + (bot_img_box_h - h) / 2
+
+            buf.seek(0)
+            slide.shapes.add_picture(buf, pic_left, pic_top, width=int(w), height=int(h))
+
+            img_center_x = pic_left + (w / 2)
+            label_y = pic_top + h + img_label_gap
+            add_label_under(slide, img_center_x, label_y, label, box_w=Inches(1.3))
+
+
+# =========================
+# Main processing (recursive)
+# Each subfolder => 1 PPT:
+#  - slides for each U### group + final montage slide (7-in-1)
+# =========================
+def process(folder, out_root, progress_cb, status_cb):
+    # subfolders directly under selected folder
+    subfolders = [
+        os.path.join(folder, d)
+        for d in os.listdir(folder)
+        if os.path.isdir(os.path.join(folder, d))
+    ]
+    if not subfolders:
+        subfolders = [folder]
+
+    folder_groups = []
+    total_groups = 0
+
+    for sf in sorted(subfolders):
+        all_files = []
+        for root, _, files in os.walk(sf):
+            for f in files:
+                if re.search(r"_U\d{3}_Pad", f, re.IGNORECASE):
+                    all_files.append(os.path.join(root, f))
+
+        groups = defaultdict(list)
+        for p in all_files:
+            m = re.search(r"_U(\d{3})_Pad", os.path.basename(p), re.IGNORECASE)
+            if m:
+                groups[f"U{m.group(1)}"].append(p)
+
+        if groups:
+            folder_groups.append((sf, groups))
+            total_groups += len(groups)
+
+    if total_groups == 0:
+        raise RuntimeError("No matching files found. Need filenames containing: _U###_Pad")
+
+    def u_sort_key(u):
+        m = re.search(r"U(\d+)", u)
+        return int(m.group(1)) if m else 999999
+
+    done = 0
+    os.makedirs(out_root, exist_ok=True)
+
+    for sf, groups in folder_groups:
+        base = safe_name(os.path.basename(sf))
+        out_pptx = os.path.join(out_root, f"{base}.pptx")
+
+        status_cb(f"Building PPT: {base}.pptx")
+        prs = Presentation()
+        set_16x9(prs)
+
+        montage_items = []
+
+        for mm_label in sorted(groups.keys(), key=u_sort_key):
+            paths = groups[mm_label]
+
+            warn = ""
+            if len(paths) != 5:
+                warn = f"  (files={len(paths)})"
+
+            roles = pick_roles(paths)
+            img = compose_cross(roles)
+
+            buf = io.BytesIO()
+            img.save(buf, "PNG")
+            buf.seek(0)
+
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            add_board_id(slide, f"{mm_label}{warn}")
+            add_centered_image(prs, slide, buf)
+
+            montage_items.append((mm_label, io.BytesIO(buf.getvalue())))
+
+            done += 1
+            progress_cb(done, total_groups)
+
+        # final montage slide
+        if len(montage_items) >= 7:
+            add_montage_slide_4_3(prs, montage_items[:7])
+        elif len(montage_items) > 0:
+            fill = montage_items + montage_items[: max(0, 7 - len(montage_items))]
+            add_montage_slide_4_3(prs, fill[:7])
+
+        prs.save(out_pptx)
+
+    status_cb("Done")
+
+
+# ======================================================
+# UI (CustomTkinter style like your sample, without Select File)
+# ======================================================
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        # --- App icon (works in dev + PyInstaller if you bundle app.ico) ---
+        try:
+            self.iconbitmap(resource_path("app.ico"))
+        except Exception:
+            pass
+
+        self.title("MM XRAY Pad Arranger")
+        self.geometry("750x450")
+        ctk.set_appearance_mode("System")
+
+        self.selected_path = ctk.StringVar(value="No input selected")
+        self.status = ctk.StringVar(value="Ready")
+        self.output_folder = None  # will be set after run
+
+        main = ctk.CTkFrame(self, corner_radius=10)
+        main.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(
+            main,
+            text="MM XRAY Pad Arranger",
+            font=ctk.CTkFont(size=26, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(20, 0))
+
+        input_frame = ctk.CTkFrame(main, corner_radius=10)
+        input_frame.pack(fill="x", padx=20, pady=20)
+        input_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        ctk.CTkLabel(
+            input_frame,
+            textvariable=self.selected_path,
+            fg_color=("#E5E7E9", "#2C2C2C"),
+            corner_radius=6,
+            anchor="w",
+            justify="left"
+        ).grid(row=0, column=0, columnspan=4, sticky="ew", padx=15, pady=15)
+
+        # Buttons row (same style)
+        ctk.CTkButton(
+            input_frame, text="Select Folder", command=self.pick_folder,
+            fg_color="#3498DB", hover_color="#2E86C1"
+        ).grid(row=1, column=0, padx=(15, 5), pady=10, sticky="ew")
+
+        self.btn_start = ctk.CTkButton(
+            input_frame, text="Start", command=self.start,
+            state="disabled", fg_color="#2ECC71", hover_color="#27AE60",
+            font=ctk.CTkFont(weight="bold")
+        )
+        self.btn_start.grid(row=1, column=1, padx=5, pady=10, sticky="ew")
+
+        ctk.CTkButton(
+            input_frame, text="Clear", command=self.clear,
+            fg_color="#E74C3C", hover_color="#C0392B",
+            font=ctk.CTkFont(weight="bold")
+        ).grid(row=1, column=2, padx=5, pady=10, sticky="ew")
+
+        self.btn_open_out = ctk.CTkButton(
+            input_frame, text="Open Output Folder", command=self.open_output_folder,
+            state="disabled", fg_color="#95A5A6", hover_color="#7F8C8D"
+        )
+        self.btn_open_out.grid(row=1, column=3, padx=(5, 15), pady=10, sticky="ew")
+
+        self.pb = ctk.CTkProgressBar(main)
+        self.pb.pack(fill="x", padx=20, pady=(10, 0))
+        self.pb.set(0)
+
+        ctk.CTkLabel(main, textvariable=self.status).pack(anchor="w", padx=20, pady=10)
+
+    def pick_folder(self):
+        p = filedialog.askdirectory()
+        if p:
+            self.selected_path.set(p)
+            self.btn_start.configure(state="normal")
+            self.btn_open_out.configure(state="disabled")
+            self.output_folder = None
+
+    def clear(self):
+        self.selected_path.set("No input selected")
+        self.status.set("Ready")
+        self.pb.set(0)
+        self.output_folder = None
+        self.btn_start.configure(state="disabled")
+        self.btn_open_out.configure(state="disabled")
+
+    def open_output_folder(self):
+        if self.output_folder and os.path.isdir(self.output_folder):
+            open_folder(self.output_folder)
+        else:
+            messagebox.showinfo("Info", "No output folder yet. Run first.")
+
+    def start(self):
+        root_folder = self.selected_path.get()
+        if not root_folder or root_folder == "No input selected":
+            messagebox.showerror("Error", "Please select a folder first.")
+            return
+
+        # Create output folder (named after selected folder)
+        out = get_output_folder(root_folder)
+        self.output_folder = out
+
+        self.btn_start.configure(state="disabled")
+        self.btn_open_out.configure(state="disabled")
+        self.pb.set(0)
+        self.status.set("Running...")
+
+        def progress(done, total):
+            self.after(0, lambda: self.pb.set(done / total if total else 1.0))
+
+        def status_cb(msg):
+            self.after(0, lambda: self.status.set(msg))
+
+        def worker():
+            try:
+                process(root_folder, out, progress, status_cb)
+                self.after(0, lambda: self.status.set(f"Done → {out}"))
+                self.after(0, lambda: self.btn_open_out.configure(state="normal"))
+                self.after(0, lambda: messagebox.showinfo("Done", f"Saved in:\n{out}"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Error", str(e)))
+                self.after(0, lambda: self.status.set(f"Failed: {e}"))
+            finally:
+                self.after(0, lambda: self.btn_start.configure(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+if __name__ == "__main__":
+    App().mainloop()
