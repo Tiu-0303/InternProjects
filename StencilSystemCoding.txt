@@ -1,0 +1,3764 @@
+import os
+import sys
+import sqlite3
+import hashlib
+import subprocess
+import pandas as pd
+import math
+import calendar
+from datetime import datetime, timedelta
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import customtkinter as ctk
+from pathlib import Path
+import shutil
+import threading
+import time
+import socket
+import psutil
+
+# ---------- Performance Configuration ----------
+DB_LOCK_TIMEOUT = 30  # seconds
+db_operation_lock = threading.RLock()
+REFRESH_MS = 30000  # 30 seconds for background sync (increased for performance)
+BATCH_REFRESH_ENABLED = True
+MIN_REFRESH_INTERVAL = 5.0  # Minimum seconds between refreshes
+SYNC_CHECK_INTERVAL = 30  # Seconds between sync checks
+
+# ---------- Login System Config ----------
+DB_FILE = "users.db"
+DEFAULT_ADMIN = ("admin", "1234", "Admin")
+APP_WIDTH = 520
+APP_HEIGHT = 520
+HEADER_COLOR = "#0ea5e9"
+GLASS_BG = "#f8fbff"
+CARD_BG = "#ffffff"
+ACCENT_GLOW = "#60a5fa"
+BTN_LOGIN_COLOR = "#10b981"
+BTN_EXIT_COLOR = "#9ca3af"
+ROLE_ADMIN = "Admin"
+ROLE_USER = "User"
+FONT_NAME = "Segoe UI"
+APP_NAME = "Stencil Management System"
+
+APP_VERSION = "1.0.2"  # <-- update this when you build a new version
+
+LAST_KNOWN_MTIME = None
+
+
+# --- Auto-update config (network share) ---
+UPDATE_DIR = r"\\mygbynbyn1fd797\L2 Engineering Folder\Stencil Data Management\Stencil App Setup"
+LATEST_VERSION_FILE = os.path.join(UPDATE_DIR, "latest_version.txt")
+
+
+# Network share path for database storage
+NETWORK_SHARE_PATH = r"\\MYGBYNBYN1FD797\L2 Engineering Folder\Stencil Data Management"
+
+# ------------------ Local Testing Toggle ------------------
+# Set to True for local testing (NO network share usage).
+# Set to False in production to use the server share.
+LOCAL_TEST_MODE = False
+
+# Filenames
+USERS_DB_NAME = "users.db"
+STENCIL_DB_NAME = "stencil_management.db"
+
+# ---------- Stencil System Config ----------
+DATABASE_FILE = "stencil_management.db"
+STATUS_OPTIONS = ["In Use", "Returned"]
+PRODUCT_FAMILIES = ["Matrix", "Automotive", "3D LED"]
+PRODUCTION_LINES = ["SMT 7", "SMT 8", "SMT 9"]
+
+# ---------- Column order (single source of truth) ----------
+COLUMN_ORDER = [
+    "Model Name", "PCB P/N", "Stencil/Job Number", "Product Family", "Quantity", "Thickness",
+    "Fabrication Date", "Status", "Operator", "Production_Line", "Storage_Row", "Last Updated"
+]
+
+# ---------- Performance Optimizations ----------
+class PerformanceCache:
+    """Cache frequently accessed data to reduce database calls"""
+    def __init__(self, ttl=30):  # 30 second TTL
+        self.ttl = ttl
+        self._cache = {}
+        self._timestamps = {}
+    
+    def get(self, key):
+        now = time.time()
+        if key in self._cache and (now - self._timestamps.get(key, 0)) < self.ttl:
+            return self._cache[key]
+        return None
+    
+    def set(self, key, value):
+        self._cache[key] = value
+        self._timestamps[key] = time.time()
+    
+    def clear(self, key=None):
+        if key:
+            self._cache.pop(key, None)
+            self._timestamps.pop(key, None)
+        else:
+            self._cache.clear()
+            self._timestamps.clear()
+
+# Global cache instances
+stencil_cache = PerformanceCache(ttl=10)  # Reduced TTL for better sync
+user_cache = PerformanceCache(ttl=120)
+
+# ---------- Smart Sync System ----------
+class SmartSyncManager:
+    def __init__(self):
+        self.last_sync_check = 0
+        self.last_known_timestamp = None
+        self.sync_in_progress = False
+        self.external_changes_detected = False
+        self.app_focused = True
+        
+    def get_database_timestamp(self):
+        """Get the most recent last_updated timestamp from database"""
+        try:
+            with db_operation_lock:
+                conn = get_thread_safe_connection(get_stencil_db_path())
+                cursor = conn.cursor()
+                cursor.execute('SELECT MAX(last_updated) FROM stencils')
+                result = cursor.fetchone()[0]
+                conn.close()
+                return result
+        except Exception as e:
+            print(f"Error getting database timestamp: {e}")
+            return None
+    
+    def has_external_changes(self):
+        """Check if external changes occurred since last sync"""
+        try:
+            current_timestamp = self.get_database_timestamp()
+            
+            # First check or no previous timestamp
+            if not self.last_known_timestamp:
+                self.last_known_timestamp = current_timestamp
+                return False
+            
+            # Compare timestamps
+            if current_timestamp and current_timestamp > self.last_known_timestamp:
+                print(f"External changes detected: {current_timestamp} > {self.last_known_timestamp}")
+                return True
+            
+            return False
+        except Exception as e:
+            print(f"Error checking external changes: {e}")
+            return False
+    
+    def perform_sync(self):
+        """Perform background sync if external changes detected"""
+        if self.sync_in_progress:
+            return
+            
+        current_time = time.time()
+        if current_time - self.last_sync_check < SYNC_CHECK_INTERVAL:
+            return
+            
+        self.last_sync_check = current_time
+        
+        if self.has_external_changes():
+            print("Performing background sync...")
+            self.sync_in_progress = True
+            self.external_changes_detected = True
+            
+            # Update timestamp
+            self.last_known_timestamp = self.get_database_timestamp()
+            
+            # Clear caches to force fresh data
+            stencil_cache.clear()
+            user_cache.clear()
+            
+            self.sync_in_progress = False
+
+# Global sync manager
+sync_manager = SmartSyncManager()
+
+# ---------- Enhanced Network Storage Functions ----------
+def get_network_database_path(db_name):
+    """Get network database path - returns None if network unavailable"""
+    if LOCAL_TEST_MODE:
+        return None
+
+    try:
+        network_path = Path(NETWORK_SHARE_PATH) / APP_NAME / "databases" / db_name
+        network_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Test write permission
+        test_file = network_path.parent / "write_test.tmp"
+        test_file.touch()
+        test_file.unlink()
+        
+        return network_path
+    except Exception as e:
+        print(f"Network path unavailable: {e}")
+        return None
+
+def get_database_path(db_name):
+    """Get database path with network priority and local fallback"""
+    network_path = get_network_database_path(db_name)
+    if network_path:
+        return network_path
+    
+    # Local fallback
+    local_path = user_data_dir() / db_name
+    return local_path
+
+def get_network_backup_dir():
+    """Get network backup directory"""
+    if LOCAL_TEST_MODE:
+        return None
+
+    try:
+        backup_dir = Path(NETWORK_SHARE_PATH) / APP_NAME / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        return backup_dir
+    except Exception:
+        return None
+
+# ---------- Thread-Safe Database Connection ----------
+def get_thread_safe_connection(db_path):
+    """Get a connection with proper timeout for multi-user access"""
+    conn = sqlite3.connect(
+        str(db_path),
+        timeout=30.0,
+        check_same_thread=False
+    )
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=10000")
+    return conn
+
+# ---------- Fast Boot Optimizations ----------
+def optimize_system_startup():
+    """Optimize system startup performance"""
+    # Pre-load essential modules
+    import pandas as pd
+    import customtkinter as ctk
+    
+    # Set pandas options for better performance
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.expand_frame_repr', False)
+    
+    # Initialize theme early
+    load_theme_safe()
+
+# ---------- Active Users Management Functions ----------
+def get_active_users():
+    """Show currently active users - with caching"""
+    cache_key = "active_users"
+    cached = user_cache.get(cache_key)
+    if cached is not None:
+        return cached
+        
+    try:
+        activity_df = load_activity_df()
+        # Get users active in last 2 minutes
+        recent_cutoff = (datetime.now() - pd.Timedelta(minutes=2)).strftime('%Y-%m-%d %H:%M:%S')
+        recent_users = activity_df[activity_df['Date & Time'] > recent_cutoff]
+        result = recent_users['Operator'].unique().tolist()
+        user_cache.set(cache_key, result)
+        return result
+    except:
+        return []
+
+# ---------- Login System Helpers ----------
+def set_window_icon(win):
+    try:
+        ico_path = resource_path("myicon.ico")
+        win.iconbitmap(str(ico_path))
+    except Exception as e:
+        print(f"[icon] could not set icon: {e}")
+
+def resource_path(rel: str) -> Path:
+    if hasattr(sys, "frozen"):
+        return Path(sys._MEIPASS) / rel
+    return Path(__file__).parent / rel
+
+def load_theme_safe():
+    # Ultra-fast theme loading
+    try:
+        ctk.set_appearance_mode("Light")
+        ctk.set_default_color_theme("blue")
+    except Exception:
+        pass  # Use defaults
+
+def parse_version(v: str):
+    """Convert '1.2.3' into a tuple (1,2,3) for comparison."""
+    try:
+        return tuple(int(x) for x in v.strip().split("."))
+    except Exception:
+        return (0, 0, 0)
+
+
+def check_for_update(parent_win=None):
+    """
+    Check network share for a newer version.
+    If found and user agrees, launch installer and signal 'updating'.
+    """
+    try:
+        if not os.path.exists(LATEST_VERSION_FILE):
+            return  # no update info available
+
+        with open(LATEST_VERSION_FILE, "r", encoding="utf-8") as f:
+            latest = f.read().strip()
+
+        if not latest:
+            return
+
+        if parse_version(latest) <= parse_version(APP_VERSION):
+            return  # already up to date
+
+        # Ask user if they want to update
+        msg = (f"A new version ({latest}) is available.\n"
+               f"You are running {APP_VERSION}.\n\n"
+               "Do you want to update now?")
+        if not messagebox.askyesno("Update Available", msg, parent=parent_win):
+            return
+
+        # Expected installer name on the server
+        installer_name = f"Stencil_Setup_{latest}.exe"
+        installer_path = os.path.join(UPDATE_DIR, installer_name)
+
+        if not os.path.exists(installer_path):
+            messagebox.showerror(
+                "Update Error",
+                f"Installer not found:\n{installer_path}",
+                parent=parent_win
+            )
+            return
+
+        # Start installer and tell caller we're updating
+        subprocess.Popen([installer_path])
+        return "updating"
+
+    except Exception as e:
+        print(f"[update] check_for_update failed: {e}")
+        return
+
+
+def user_data_dir() -> Path:
+    base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    d = base / APP_NAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def get_users_db_path() -> Path:
+    return get_database_path(USERS_DB_NAME)
+
+def get_stencil_db_path() -> Path:
+    return get_database_path(STENCIL_DB_NAME)
+
+def ensure_seed_db(target: Path, seed_name: str):
+    if not target.exists():
+        seed = resource_path(seed_name)
+        if seed.exists():
+            shutil.copy2(seed, target)
+        else:
+            target.touch()
+
+def hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+
+def init_db():
+    ensure_seed_db(get_users_db_path(), USERS_DB_NAME)
+
+    conn = sqlite3.connect(get_users_db_path())
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    c.execute("SELECT COUNT(*) FROM users")
+    if c.fetchone()[0] == 0:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute("INSERT INTO users (username, password_hash, role, created_at) VALUES (?,?,?,?)",
+                  (DEFAULT_ADMIN[0], hash_pw(DEFAULT_ADMIN[1]), DEFAULT_ADMIN[2], now))
+        conn.commit()
+    conn.close()
+
+def verify_user(username: str, password: str):
+    conn = sqlite3.connect(get_users_db_path())
+    c = conn.cursor()
+    c.execute("SELECT role, password_hash FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    role, pw_hash = row
+    return role if hash_pw(password) == pw_hash else None
+
+def get_all_users():
+    conn = sqlite3.connect(get_users_db_path())
+    c = conn.cursor()
+    c.execute("SELECT username, role, created_at FROM users ORDER BY username COLLATE NOCASE")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def add_user_to_db(username: str, password: str, role: str):
+    if not username or not password:
+        return False, "Username and password required."
+    conn = sqlite3.connect(get_users_db_path())
+    c = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        c.execute("INSERT INTO users (username, password_hash, role, created_at) VALUES (?,?,?,?)",
+                  (username, hash_pw(password), role, now))
+        conn.commit()
+        return True, None
+    except sqlite3.IntegrityError:
+        return False, "Username already exists."
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
+def delete_user_from_db(username: str):
+    if username == DEFAULT_ADMIN[0]:
+        return False, "Default admin cannot be deleted."
+    conn = sqlite3.connect(get_users_db_path())
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM users WHERE username = ?", (username,))
+        conn.commit()
+        if c.rowcount == 0:
+            return False, "User not found."
+        return True, None
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
+# ---------- Stencil System Database Functions (OPTIMIZED) ----------
+def init_database():
+    """Initialize SQLite database with required tables - optimized version"""
+    with db_operation_lock:
+        try:
+            ensure_seed_db(get_stencil_db_path(), STENCIL_DB_NAME)
+            conn = get_thread_safe_connection(get_stencil_db_path())
+            cursor = conn.cursor()
+            
+            # Active stencils table with indexes for better performance
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS stencils (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_name TEXT,
+                    pcb_part_number TEXT,
+                    stencil_job_number TEXT UNIQUE NOT NULL,
+                    product_family TEXT,
+                    quantity TEXT,
+                    thickness TEXT,
+                    fabrication_date TEXT,
+                    status TEXT,
+                    operator TEXT,
+                    production_line TEXT,
+                    storage_row TEXT,
+                    last_updated TEXT
+                )
+            ''')
+            
+            # Create indexes for frequently queried columns
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_stencil_job_number ON stencils(stencil_job_number)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_status ON stencils(status)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_operator ON stencils(operator)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_last_updated ON stencils(last_updated)')
+            
+            # Activity log table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS activity_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    operator TEXT,
+                    action_type TEXT,
+                    stencil_job_number TEXT,
+                    from_status TEXT,
+                    to_status TEXT,
+                    production_line TEXT,
+                    storage_location TEXT,
+                    detailed_description TEXT
+                )
+            ''')
+            
+            # Create indexes for activity log
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_activity_operator ON activity_log(operator)')
+            
+            # Deleted stencils archive
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS deleted_stencils (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    operator TEXT,
+                    stencil_job_number TEXT,
+                    storage_row TEXT,
+                    action TEXT,
+                    remarks TEXT
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            print("Database initialized successfully with performance indexes")
+        except Exception as e:
+            print(f"Database initialization error: {e}")
+
+def now_ts():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def load_active_df():
+    """Load all active stencils as DataFrame - optimized with caching"""
+    cache_key = "active_stencils"
+    cached = stencil_cache.get(cache_key)
+    if cached is not None and not sync_manager.external_changes_detected:
+        return cached
+        
+    with db_operation_lock:
+        try:
+            conn = get_thread_safe_connection(get_stencil_db_path())
+            # Use more efficient query with specific columns only
+            df = pd.read_sql('''
+                SELECT 
+                    model_name as "Model Name",
+                    pcb_part_number as "PCB P/N",
+                    stencil_job_number as "Stencil/Job Number",
+                    product_family as "Product Family",
+                    quantity as "Quantity",
+                    thickness as "Thickness",
+                    fabrication_date as "Fabrication Date",
+                    status as "Status",
+                    operator as "Operator",
+                    production_line as "Production_Line",
+                    storage_row as "Storage_Row",
+                    last_updated as "Last Updated"
+                FROM stencils 
+                ORDER BY stencil_job_number
+            ''', conn)
+            conn.close()
+            result = df.fillna("")
+            stencil_cache.set(cache_key, result)
+            sync_manager.external_changes_detected = False  # Reset after refresh
+            return result
+        except Exception as e:
+            print(f"Error loading active stencils: {e}")
+            return pd.DataFrame(columns=COLUMN_ORDER).fillna("")
+
+def load_activity_df():
+    """Load activity log as DataFrame - optimized with limit"""
+    with db_operation_lock:
+        try:
+            conn = get_thread_safe_connection(get_stencil_db_path())
+            # Limit to recent activities for better performance
+            df = pd.read_sql('''
+                SELECT 
+                    timestamp as "Date & Time",
+                    operator as "Operator",
+                    action_type as "Action Type",
+                    stencil_job_number as "Stencil/Job Number",
+                    from_status as "From_Status",
+                    to_status as "To_Status",
+                    production_line as "Production_Line",
+                    storage_location as "Storage_Location",
+                    detailed_description as "Detailed_Description"
+                FROM activity_log 
+                ORDER BY timestamp DESC
+                LIMIT 1000
+            ''', conn)
+            conn.close()
+            return df.fillna("")
+        except Exception as e:
+            print(f"Error loading activity log: {e}")
+            return pd.DataFrame(columns=["Date & Time", "Operator", "Action Type", "Stencil/Job Number", 
+                                       "From_Status", "To_Status", "Production_Line", "Storage_Location", 
+                                       "Detailed_Description"]).fillna("")
+
+def load_deleted_df():
+    """Load deleted stencils as DataFrame - optimized with limit"""
+    with db_operation_lock:
+        try:
+            conn = get_thread_safe_connection(get_stencil_db_path())
+            df = pd.read_sql('''
+                SELECT 
+                    timestamp as "Date & Time",
+                    operator as "Operator",
+                    stencil_job_number as "Stencil/Job Number",
+                    storage_row as "Row",
+                    action as "Action",
+                    remarks as "Remarks"
+                FROM deleted_stencils 
+                ORDER BY timestamp DESC
+                LIMIT 500
+            ''', conn)
+            conn.close()
+            return df.fillna("")
+        except Exception as e:
+            print(f"Error loading deleted stencils: {e}")
+            return pd.DataFrame(columns=["Date & Time", "Operator", "Stencil/Job Number", "Row", "Action", "Remarks"]).fillna("")
+
+def save_stencil(stencil_data):
+    """Save or update a stencil record - optimized version"""
+    with db_operation_lock:
+        try:
+            conn = get_thread_safe_connection(get_stencil_db_path())
+            cursor = conn.cursor()
+            
+            # Use more efficient EXISTS check
+            cursor.execute('SELECT 1 FROM stencils WHERE stencil_job_number = ? LIMIT 1', 
+                           (stencil_data['stencil_job_number'],))
+            exists = cursor.fetchone() is not None
+            
+            if exists:
+                # Update existing
+                cursor.execute('''
+                    UPDATE stencils SET
+                        model_name=?, pcb_part_number=?, product_family=?, quantity=?,
+                        thickness=?, fabrication_date=?, status=?, operator=?,
+                        production_line=?, storage_row=?, last_updated=?
+                    WHERE stencil_job_number=?
+                ''', (
+                    stencil_data['model_name'], stencil_data['pcb_part_number'],
+                    stencil_data['product_family'], stencil_data['quantity'],
+                    stencil_data['thickness'], stencil_data['fabrication_date'],
+                    stencil_data['status'], stencil_data['operator'],
+                    stencil_data['production_line'], stencil_data['storage_row'],
+                    now_ts(), stencil_data['stencil_job_number']
+                ))
+            else:
+                # Insert new
+                cursor.execute('''
+                    INSERT INTO stencils (
+                        model_name, pcb_part_number, stencil_job_number, product_family,
+                        quantity, thickness, fabrication_date, status, operator,
+                        production_line, storage_row, last_updated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    stencil_data['model_name'], stencil_data['pcb_part_number'],
+                    stencil_data['stencil_job_number'], stencil_data['product_family'],
+                    stencil_data['quantity'], stencil_data['thickness'],
+                    stencil_data['fabrication_date'], stencil_data['status'],
+                    stencil_data['operator'], stencil_data['production_line'],
+                    stencil_data['storage_row'], now_ts()
+                ))
+            
+            conn.commit()
+            # Clear relevant caches
+            stencil_cache.clear("active_stencils")
+            # Update sync manager timestamp
+            sync_manager.last_known_timestamp = now_ts()
+            return True
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e):
+                time.sleep(0.1)
+                return save_stencil(stencil_data)
+            print(f"Error saving stencil: {e}")
+            return False
+        except Exception as e:
+            print(f"Error saving stencil: {e}")
+            return False
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+
+def delete_stencil(stencil_job_number):
+    """Delete a stencil record - optimized version"""
+    with db_operation_lock:
+        try:
+            conn = get_thread_safe_connection(get_stencil_db_path())
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM stencils WHERE stencil_job_number = ?', (stencil_job_number,))
+            conn.commit()
+            # Clear relevant caches
+            stencil_cache.clear("active_stencils")
+            # Update sync manager timestamp
+            sync_manager.last_known_timestamp = now_ts()
+            return True
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e):
+                time.sleep(0.1)
+                return delete_stencil(stencil_job_number)
+            print(f"Error deleting stencil: {e}")
+            return False
+        except Exception as e:
+            print(f"Error deleting stencil: {e}")
+            return False
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+
+def log_activity(operator, action_type, stencil_job_number="", from_status="", 
+                to_status="", production_line="", storage_location="", description=""):
+    """Log an activity - optimized with batch potential"""
+    with db_operation_lock:
+        try:
+            conn = get_thread_safe_connection(get_stencil_db_path())
+            cursor = conn.cursor()
+            
+            pc_name = socket.gethostname()
+            enhanced_description = f"[PC: {pc_name}] {description}" if description else f"[PC: {pc_name}]"
+            
+            cursor.execute('''
+                INSERT INTO activity_log (
+                    timestamp, operator, action_type, stencil_job_number, from_status,
+                    to_status, production_line, storage_location, detailed_description
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                now_ts(), operator, action_type, stencil_job_number, from_status,
+                to_status, production_line, storage_location, enhanced_description
+            ))
+            
+            conn.commit()
+            # Clear user cache since activity affects active users
+            user_cache.clear("active_users")
+            return True
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e):
+                time.sleep(0.1)
+                return log_activity(operator, action_type, stencil_job_number, from_status, 
+                                  to_status, production_line, storage_location, description)
+            print(f"Error logging activity: {e}")
+            return False
+        except Exception as e:
+            print(f"Error logging activity: {e}")
+            return False
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+
+def log_deleted(operator, stencil_job_number, storage_row, remarks):
+    """Log a deleted stencil - optimized"""
+    with db_operation_lock:
+        try:
+            conn = get_thread_safe_connection(get_stencil_db_path())
+            cursor = conn.cursor()
+            
+            pc_name = socket.gethostname()
+            enhanced_remarks = f"[PC: {pc_name}] {remarks}" if remarks else f"[PC: {pc_name}]"
+            
+            cursor.execute('''
+                INSERT INTO deleted_stencils (
+                    timestamp, operator, stencil_job_number, storage_row, action, remarks
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                now_ts(), operator, stencil_job_number, storage_row, "Deleted", enhanced_remarks
+            ))
+            
+            conn.commit()
+            return True
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e):
+                time.sleep(0.1)
+                return log_deleted(operator, stencil_job_number, storage_row, remarks)
+            print(f"Error logging deletion: {e}")
+            return False
+        except Exception as e:
+            print(f"Error logging deletion: {e}")
+            return False
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+
+def get_stencil(stencil_job_number):
+    """Get a single stencil record - optimized with caching"""
+    cache_key = f"stencil_{stencil_job_number}"
+    cached = stencil_cache.get(cache_key)
+    if cached is not None:
+        return cached
+        
+    with db_operation_lock:
+        try:
+            conn = get_thread_safe_connection(get_stencil_db_path())
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT * FROM stencils WHERE stencil_job_number = ?', (stencil_job_number,))
+            
+            result = cursor.fetchone()
+            
+            if result:
+                columns = [desc[0] for desc in cursor.description]
+                stencil_data = dict(zip(columns, result))
+                stencil_cache.set(cache_key, stencil_data)
+                return stencil_data
+            return None
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e):
+                time.sleep(0.1)
+                return get_stencil(stencil_job_number)
+            print(f"Error getting stencil: {e}")
+            return None
+        except Exception as e:
+            print(f"Error getting stencil: {e}")
+            return None
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+
+def stencil_exists(stencil_job_number):
+    """Check if stencil exists - optimized"""
+    cache_key = f"exists_{stencil_job_number}"
+    cached = stencil_cache.get(cache_key)
+    if cached is not None:
+        return cached
+        
+    with db_operation_lock:
+        try:
+            conn = get_thread_safe_connection(get_stencil_db_path())
+            cursor = conn.cursor()
+            cursor.execute('SELECT 1 FROM stencils WHERE stencil_job_number = ? LIMIT 1', (stencil_job_number,))
+            exists = cursor.fetchone() is not None
+            conn.close()
+            stencil_cache.set(cache_key, exists)
+            return exists
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e):
+                time.sleep(0.1)
+                return stencil_exists(stencil_job_number)
+            print(f"Error checking stencil existence: {e}")
+            return False
+        except Exception as e:
+            print(f"Error checking stencil existence: {e}")
+            return False
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+
+# ---------- UI Setup ----------
+ctk.set_appearance_mode("Light")
+load_theme_safe()
+
+class FadeMixin:
+    """Provides non-blocking fade in/out animations using after."""
+    def _fade_in(self, widget, steps=20, step=0):
+        alpha = (step / steps)
+        widget.attributes("-alpha", alpha)
+        if step < steps:
+            widget.after(12, self._fade_in, widget, steps, step + 1)
+
+    def _fade_out_and(self, widget, steps=20, step=0, after_cb=None):
+        alpha = 1.0 - (step / steps)
+        widget.attributes("-alpha", alpha)
+        if step < steps:
+            widget.after(12, self._fade_out_and, widget, steps, step + 1, after_cb)
+        else:
+            if after_cb:
+                after_cb()
+
+class GlassCard(ctk.CTkFrame):
+    """A lightly styled card to imitate glass (rounded + subtle border)."""
+    def __init__(self, master=None, **kwargs):
+        super().__init__(master, corner_radius=14, fg_color=CARD_BG, **kwargs)
+
+# ---------- Login System Classes ----------
+class LoginApp(FadeMixin):
+    def __init__(self):
+        load_theme_safe()
+        self.root = ctk.CTk()
+        set_window_icon(self.root)
+        self.root.title("🔐 Lumileds Stencil System - Login")
+        self.root.geometry(f"{APP_WIDTH}x{APP_HEIGHT}")
+        self.root.resizable(False, False)
+        self.center_window(APP_WIDTH, APP_HEIGHT)
+        # glass-like background
+        self.root.configure(fg_color=GLASS_BG)
+        # set initial transparency to 0 then fade in
+        self.root.attributes("-alpha", 0.0)
+
+        # Outer container for center alignment
+        outer = ctk.CTkFrame(self.root, fg_color="transparent")
+        outer.pack(expand=True, fill="both")
+
+        # Card container
+        self.card = GlassCard(outer, width=460, height=460)
+        self.card.pack(padx=20, pady=20)
+        self.card.pack_propagate(False)
+
+        # header area
+        header = ctk.CTkFrame(self.card, height=90, fg_color=HEADER_COLOR, corner_radius=12)
+        header.pack(fill="x", padx=18, pady=(18, 6))
+        header.pack_propagate(False)
+        header_label = ctk.CTkLabel(header, text="🔐 STENCIL SYSTEM LOGIN", font=ctk.CTkFont(size=18, weight="bold"),
+                                    text_color="white")
+        header_label.place(relx=0.02, rely=0.15)
+
+        subtitle = ctk.CTkLabel(header, text="Secure access · Admin controls", font=ctk.CTkFont(size=11),
+                                text_color="white")
+        subtitle.place(relx=0.02, rely=0.6)
+
+        # content frame
+        content = ctk.CTkFrame(self.card, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=(6, 18))
+
+        # Username
+        self.username_var = tk.StringVar()
+        lbl_user = ctk.CTkLabel(content, text="Username", anchor="w",
+                                font=ctk.CTkFont(size=12, weight="bold"), text_color="#0f172a")
+        lbl_user.pack(fill="x", pady=(6, 4))
+        self.username_entry = ctk.CTkEntry(content, textvariable=self.username_var,
+                                           placeholder_text="Enter your username",
+                                           height=40, corner_radius=10)
+        self.username_entry.pack(fill="x")
+
+        # Password
+        self.password_var = tk.StringVar()
+        lbl_pw = ctk.CTkLabel(content, text="Password", anchor="w",
+                              font=ctk.CTkFont(size=12, weight="bold"), text_color="#0f172a")
+        lbl_pw.pack(fill="x", pady=(12, 4))
+        self.password_entry = ctk.CTkEntry(content, textvariable=self.password_var,
+                                           placeholder_text="Enter your password",
+                                           show="•", height=40, corner_radius=10)
+        self.password_entry.pack(fill="x")
+
+        # Error message
+        self.error_label = ctk.CTkLabel(content, text="", text_color="#dc2626",
+                                       font=ctk.CTkFont(size=11), anchor="center")
+        self.error_label.pack(fill="x", pady=(8, 6))
+
+        # Buttons row (3 buttons)
+        btn_frame = ctk.CTkFrame(content, fg_color="transparent", height=46)
+        btn_frame.pack(fill="x", pady=(6, 2))
+        btn_frame.pack_propagate(False)
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
+        btn_frame.grid_columnconfigure(2, weight=1)
+
+        self.login_button = ctk.CTkButton(btn_frame, text="LOGIN", command=self.handle_login,
+                                          height=42, corner_radius=10, fg_color=BTN_LOGIN_COLOR,
+                                          font=ctk.CTkFont(size=12, weight="bold"))
+        self.login_button.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        self.exit_button = ctk.CTkButton(btn_frame, text="EXIT", command=self.handle_exit,
+                                         height=42, corner_radius=10, fg_color=BTN_EXIT_COLOR,
+                                         font=ctk.CTkFont(size=12, weight="bold"))
+        self.exit_button.grid(row=0, column=1, padx=6, sticky="ew")
+
+        self.manage_button = ctk.CTkButton(btn_frame, text="⚙ Manage Users", command=self.handle_manage_auth,
+                                           height=42, corner_radius=10, fg_color="#3b82f6",
+                                           font=ctk.CTkFont(size=12, weight="bold"), hover_color=ACCENT_GLOW)
+        self.manage_button.grid(row=0, column=2, padx=(6, 0), sticky="ew")
+
+        # bindings
+        self.username_entry.bind("<Return>", lambda e: self.password_entry.focus())
+        self.password_entry.bind("<Return>", lambda e: self.handle_login())
+        self.username_entry.focus()
+
+        # perform non-blocking fade-in
+        self._fade_in(self.root)
+
+    def center_window(self, width, height):
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def shake_window(self):
+        # subtle shake using after (non-blocking)
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        offsets = [6, -5, 4, -3, 2, 0]
+        delay = 20
+        for i, dx in enumerate(offsets):
+            self.root.after(i * delay, lambda dx=dx: self.root.geometry(f"+{x+dx}+{y}"))
+
+    def handle_login(self):
+        username = self.username_var.get().strip()
+        password = self.password_var.get()
+
+        if not username or not password:
+            self.error_label.configure(text="Please enter both username and password")
+            self.shake_window()
+            return
+
+        # optimistic UI change (non-blocking)
+        original_text = self.login_button.cget("text")
+        original_state = self.login_button.cget("state")
+        self.login_button.configure(text="Authenticating...", state="disabled")
+        self.root.update_idletasks()
+
+        role = verify_user(username, password)
+
+        if role:
+            self.login_button.configure(text="✓ Success!", fg_color="#059669")
+            self.error_label.configure(text="")
+            # give a short delay then launch
+            self.root.after(300, lambda: self.launch_main(username, role))
+        else:
+            self.login_button.configure(text=original_text, state=original_state)
+            self.error_label.configure(text="Invalid username or password")
+            self.shake_window()
+
+    def handle_exit(self):
+        if messagebox.askyesno("Exit", "Are you sure you want to exit?"):
+            self._fade_out_and(self.root, after_cb=self.root.destroy)
+
+    def launch_main(self, username, role):
+        # Initialize stencil database
+        init_database()
+        
+        # Launch main stencil system with the logged-in user
+        env = os.environ.copy()
+        env["LOGGED_USER"] = username
+
+        try:
+            # fade out and then launch main in same process
+            def after_fade():
+                try:
+                    # Close login window and start main application
+                    self.root.destroy()
+                    main_app = StencilManagementSystem(username, role)
+                    main_app.run()
+                except Exception as e:
+                    messagebox.showerror("Launch Error", f"Failed to launch main system:\n{str(e)}")
+            self._fade_out_and(self.root, after_cb=after_fade)
+        except Exception as e:
+            messagebox.showerror("Launch Error", f"Failed to launch main system:\n{str(e)}")
+
+    def handle_manage_auth(self):
+        dialog = AdminAuthDialog(self.root)
+        self.root.wait_window(dialog.top)
+
+        if dialog.result:
+            username, password = dialog.result
+            role = verify_user(username, password)
+
+            if role == ROLE_ADMIN:
+                ManageUsersWindow(self.root)
+            else:
+                messagebox.showerror("Access Denied", "Admin credentials required")
+
+    def run(self):
+        self.root.mainloop()
+
+class AdminAuthDialog(FadeMixin):
+    def __init__(self, parent):
+        self.top = ctk.CTkToplevel(parent)
+        self.top.title("Admin Authentication")
+        self.top.geometry("460x320")
+        self.top.resizable(False, False)
+        self.top.transient(parent)
+        self.top.grab_set()
+        self.top.configure(fg_color=GLASS_BG)
+        self.top.attributes("-alpha", 0.0)
+
+        self.center_window(460, 320)
+
+        container = GlassCard(self.top, width=420, height=280)
+        container.pack(padx=20, pady=20)
+        container.pack_propagate(False)
+
+        title = ctk.CTkLabel(container, text="Admin Authentication Required",
+                             font=ctk.CTkFont(size=16, weight="bold"), text_color="#0f172a")
+        title.pack(pady=(20, 8))
+
+        # username
+        self.username_var = tk.StringVar()
+        l1 = ctk.CTkLabel(container, text="Username", anchor="w", font=ctk.CTkFont(weight="bold"))
+        l1.pack(fill="x", padx=28)
+        username_entry = ctk.CTkEntry(container, textvariable=self.username_var, height=38, corner_radius=10)
+        username_entry.pack(fill="x", padx=28, pady=(6, 8))
+
+        # password
+        self.password_var = tk.StringVar()
+        l2 = ctk.CTkLabel(container, text="Password", anchor="w", font=ctk.CTkFont(weight="bold"))
+        l2.pack(fill="x", padx=28)
+        password_entry = ctk.CTkEntry(container, textvariable=self.password_var, show="•", height=38, corner_radius=10)
+        password_entry.pack(fill="x", padx=28, pady=(6, 12))
+
+        # buttons
+        btn_frame = ctk.CTkFrame(container, fg_color="transparent", height=44)
+        btn_frame.pack(fill="x", padx=28, pady=(6, 14))
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
+        btn_frame.grid_columnconfigure(2, weight=1)
+
+        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=self.on_cancel, fg_color=BTN_EXIT_COLOR,
+                                   height=40, corner_radius=10)
+        cancel_btn.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+
+        login_btn = ctk.CTkButton(btn_frame, text="Login", command=self.on_login, fg_color=BTN_LOGIN_COLOR,
+                                  height=40, corner_radius=10)
+        login_btn.grid(row=0, column=1, padx=8, sticky="ew")
+
+        clear_btn = ctk.CTkButton(btn_frame, text="Clear", command=self.on_clear, fg_color="#6b7280",
+                                  height=40, corner_radius=10)
+        clear_btn.grid(row=0, column=2, padx=(8, 0), sticky="ew")
+
+        self.result = None
+        username_entry.focus()
+        password_entry.bind("<Return>", lambda e: self.on_login())
+
+        self._fade_in(self.top)
+
+    def center_window(self, width, height):
+        screen_width = self.top.winfo_screenwidth()
+        screen_height = self.top.winfo_screenheight()
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        self.top.geometry(f"{width}x{height}+{x}+{y}")
+
+    def on_login(self):
+        username = self.username_var.get().strip()
+        password = self.password_var.get()
+        if username and password:
+            self.result = (username, password)
+            self._fade_out_and(self.top, after_cb=self.top.destroy)
+        else:
+            messagebox.showwarning("Input Required", "Please enter both username and password")
+
+    def on_cancel(self):
+        self.result = None
+        self._fade_out_and(self.top, after_cb=self.top.destroy)
+
+    def on_clear(self):
+        self.username_var.set("")
+        self.password_var.set("")
+
+class ManageUsersWindow(FadeMixin):
+    def __init__(self, parent):
+        self.window = ctk.CTkToplevel(parent)
+        self.window.title("User Management")
+        self.window.geometry("880x680")
+        self.window.resizable(False, False)
+        self.window.transient(parent)
+        self.window.grab_set()
+        self.window.configure(fg_color=GLASS_BG)
+        self.window.attributes("-alpha", 0.0)
+
+        self.center_window(880, 680)
+
+        main_card = GlassCard(self.window, width=820, height=620)
+        main_card.pack(padx=24, pady=24)
+        main_card.pack_propagate(False)
+
+        # Header
+        title_frame = ctk.CTkFrame(main_card, fg_color="transparent", height=70)
+        title_frame.pack(fill="x", padx=20, pady=(14, 6))
+        title_frame.pack_propagate(False)
+        title_label = ctk.CTkLabel(title_frame, text="👤 User Management",
+                                   font=ctk.CTkFont(size=20, weight="bold"), text_color="#0f172a")
+        title_label.pack(anchor="w", padx=6)
+
+        # Tree / list section
+        list_frame = ctk.CTkFrame(main_card, fg_color="transparent")
+        list_frame.pack(fill="both", expand=True, padx=20, pady=(6, 12))
+
+        section_label = ctk.CTkLabel(list_frame, text="User List", anchor="w",
+                                     font=ctk.CTkFont(size=14, weight="bold"), text_color="#334155")
+        section_label.pack(fill="x", pady=(2, 8), padx=6)
+
+        # Tree container
+        tree_container = ctk.CTkFrame(list_frame, fg_color="#f7fbff", corner_radius=10)
+        tree_container.pack(fill="both", expand=True, padx=6, pady=(0, 8))
+        tree_container.pack_propagate(False)
+
+        style = ttk.Style()
+        style.theme_use('default')
+        style.configure("Neo.Treeview",
+                        background="#ffffff",
+                        fieldbackground="#ffffff",
+                        foreground="#0f172a",
+                        rowheight=28,
+                        font=(FONT_NAME, 10))
+        style.configure("Neo.Treeview.Heading",
+                        background="#eef2ff",
+                        foreground="#0f172a",
+                        font=(FONT_NAME, 11, 'bold'))
+        style.map("Neo.Treeview.Heading", background=[('active', '#e6f0ff')])
+
+        columns = ("Username", "Role", "Created")
+        self.tree = ttk.Treeview(tree_container, columns=columns, show="headings", height=10, style="Neo.Treeview")
+        self.tree.heading("Username", text="Username")
+        self.tree.heading("Role", text="Role")
+        self.tree.heading("Created", text="Created At")
+        self.tree.column("Username", width=240, anchor="center", minwidth=180)
+        self.tree.column("Role", width=160, anchor="center", minwidth=120)
+        self.tree.column("Created", width=300, anchor="center", minwidth=200)
+
+        yscroll = ttk.Scrollbar(tree_container, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=yscroll.set)
+        self.tree.pack(side="left", fill="both", expand=True, padx=(12, 4), pady=12)
+        yscroll.pack(side="right", fill="y", padx=(0, 12), pady=12)
+
+        # Add user section
+        add_section = ctk.CTkFrame(main_card, fg_color="transparent", height=120)
+        add_section.pack(fill="x", padx=20, pady=(6, 6))
+        add_section.pack_propagate(False)
+
+        add_label = ctk.CTkLabel(add_section, text="Add New User", anchor="w",
+                                 font=ctk.CTkFont(size=14, weight="bold"), text_color="#334155")
+        add_label.pack(fill="x", padx=6, pady=(4, 6))
+
+        form_frame = ctk.CTkFrame(add_section, fg_color="transparent")
+        form_frame.pack(fill="x", padx=6, pady=(0, 6))
+        for i in range(6):
+            form_frame.grid_columnconfigure(i, weight=1, uniform="f")
+
+        # Username
+        ctk.CTkLabel(form_frame, text="Username:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=(6, 8), pady=6, sticky="w")
+        self.new_username = ctk.CTkEntry(form_frame, width=200, height=36, placeholder_text="Enter username")
+        self.new_username.grid(row=0, column=1, padx=(0, 16), pady=6, sticky="w")
+
+        # Password
+        ctk.CTkLabel(form_frame, text="Password:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=2, padx=(6, 8), pady=6, sticky="w")
+        self.new_password = ctk.CTkEntry(form_frame, width=200, height=36, placeholder_text="Enter password", show="•")
+        self.new_password.grid(row=0, column=3, padx=(0, 16), pady=6, sticky="w")
+
+        # Role
+        ctk.CTkLabel(form_frame, text="Role:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=4, padx=(6, 8), pady=6, sticky="w")
+        self.new_role = ctk.CTkComboBox(form_frame, values=[ROLE_USER, ROLE_ADMIN], width=160, height=36)
+        self.new_role.set(ROLE_USER)
+        self.new_role.grid(row=0, column=5, padx=(0, 6), pady=6, sticky="w")
+
+        # Buttons row
+        btns = ctk.CTkFrame(main_card, fg_color="transparent", height=56)
+        btns.pack(fill="x", padx=20, pady=(8, 16))
+        btns.pack_propagate(False)
+        for i in range(4):
+            btns.grid_columnconfigure(i, weight=1)
+
+        add_btn = ctk.CTkButton(btns, text="Add User", command=self.add_user, height=44, fg_color=BTN_LOGIN_COLOR, corner_radius=10)
+        add_btn.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+
+        del_btn = ctk.CTkButton(btns, text="Delete Selected", command=self.delete_user, height=44, fg_color="#ef4444", corner_radius=10)
+        del_btn.grid(row=0, column=1, padx=8, sticky="ew")
+
+        refresh_btn = ctk.CTkButton(btns, text="Refresh", command=self.load_users, height=44, fg_color="#6b7280", corner_radius=10)
+        refresh_btn.grid(row=0, column=2, padx=8, sticky="ew")
+
+        close_btn = ctk.CTkButton(btns, text="Close", command=self.window.destroy, height=44, fg_color=BTN_EXIT_COLOR, corner_radius=10)
+        close_btn.grid(row=0, column=3, padx=(8, 0), sticky="ew")
+
+        # initial load and fade-in
+        self.load_users()
+        self._fade_in(self.window)
+
+    def center_window(self, width, height):
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        self.window.geometry(f"{width}x{height}+{x}+{y}")
+
+    def load_users(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        users = get_all_users()
+        for username, role, created_at in users:
+            self.tree.insert("", "end", values=(username, role, created_at))
+
+    def add_user(self):
+        username = self.new_username.get().strip()
+        password = self.new_password.get()
+        role = self.new_role.get()
+
+        if not username or not password:
+            messagebox.showwarning("Input Required", "Please enter both username and password")
+            return
+
+        success, message = add_user_to_db(username, password, role)
+        if success:
+            messagebox.showinfo("Success", f"User '{username}' created successfully")
+            # clear inputs
+            try:
+                self.new_username.delete(0, "end")
+                self.new_password.delete(0, "end")
+                self.new_role.set(ROLE_USER)
+            except Exception:
+                # fallback if widget API differs
+                self.new_username.set("")
+                self.new_password.set("")
+                self.new_role.set(ROLE_USER)
+            self.load_users()
+        else:
+            messagebox.showerror("Error", message)
+
+    def delete_user(self):
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Selection Required", "Please select a user to delete")
+            return
+
+        username = self.tree.item(selection[0])["values"][0]
+
+        if username == DEFAULT_ADMIN[0]:
+            messagebox.showerror("Error", "Cannot delete the default admin user")
+            return
+
+        if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete user '{username}'?"):
+            success, message = delete_user_from_db(username)
+            if success:
+                messagebox.showinfo("Success", f"User '{username}' deleted successfully")
+                self.load_users()
+            else:
+                messagebox.showerror("Error", message)
+
+# ---------- Stencil System Popup Functions ----------
+def show_storage_instruction(stencil_id, from_line, storage_row, parent):
+    popup = ctk.CTkToplevel(parent)
+    popup.title("Storage Instruction - Action Required")
+    popup.geometry("800x600")
+    popup.resizable(False, False)
+    
+    popup.transient(parent)
+    popup.grab_set()
+    popup.lift()
+    popup.focus_force()
+    popup.attributes('-topmost', True)
+    
+    popup.update_idletasks()
+    x = (popup.winfo_screenwidth() // 2) - (600 // 2)
+    y = (popup.winfo_screenheight() // 2) - (500 // 2)
+    popup.geometry(f"+{x}+{y}")
+    
+    header_frame = ctk.CTkFrame(popup, fg_color="#2b7de9")
+    header_frame.pack(fill="x", padx=0, pady=0)
+    
+    ctk.CTkLabel(header_frame, text="✅ STENCIL RETURN CONFIRMED", 
+                 font=ctk.CTkFont(size=16, weight="bold"),
+                 text_color="white").pack(pady=15)
+    
+    info_frame = ctk.CTkFrame(popup)
+    info_frame.pack(fill="x", padx=20, pady=15)
+    
+    ctk.CTkLabel(info_frame, text=f"Stencil: {stencil_id}", 
+                font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=4)
+    ctk.CTkLabel(info_frame, text=f"From: {from_line}").pack(anchor="w", pady=2)
+    ctk.CTkLabel(info_frame, text="Status: Available").pack(anchor="w", pady=2)
+    
+    storage_frame = ctk.CTkFrame(popup, fg_color="#e8f4fd", corner_radius=8)
+    storage_frame.pack(fill="x", padx=20, pady=10)
+    
+    ctk.CTkLabel(storage_frame, text="📍 STORAGE LOCATION:", 
+                font=ctk.CTkFont(weight="bold")).pack(pady=(12, 5))
+    
+    location_label = ctk.CTkLabel(storage_frame, text=f"ROW {storage_row}",
+                                font=ctk.CTkFont(size=22, weight="bold"),
+                                text_color="#2b7de9")
+    location_label.pack(pady=12)
+    
+    checklist_frame = ctk.CTkFrame(popup)
+    checklist_frame.pack(fill="x", padx=20, pady=10)
+    
+    ctk.CTkLabel(checklist_frame, text="📋 REQUIRED ACTIONS:", 
+                font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=8)
+    
+    actions = [
+        "• Locate the specified storage row",
+        "• Verify stencil is clean and undamaged", 
+        "• Place in designated storage location",
+        "• Confirm placement matches system record"
+    ]
+    
+    for action in actions:
+        ctk.CTkLabel(checklist_frame, text=action).pack(anchor="w", pady=3)
+    
+    button_frame = ctk.CTkFrame(popup, fg_color="transparent")
+    button_frame.pack(pady=20)
+    
+    def on_acknowledge():
+        popup.destroy()
+    
+    acknowledge_btn = ctk.CTkButton(button_frame, 
+                                  text="ACKNOWLEDGE & CLOSE", 
+                                  command=on_acknowledge,
+                                  width=180, 
+                                  height=45,
+                                  fg_color="#27ae60",
+                                  font=ctk.CTkFont(weight="bold"))
+    acknowledge_btn.pack(pady=5)
+    
+    popup.after(100, acknowledge_btn.focus_set)
+    popup.bind('<Return>', lambda e: on_acknowledge())
+
+def show_pickup_instruction(stencil_id, production_line, storage_row, parent):
+    popup = ctk.CTkToplevel(parent)
+    popup.title("🧰 PICK UP STENCIL FROM STORAGE")
+    popup.geometry("800x600")
+    popup.resizable(False, False)
+    
+    popup.transient(parent)
+    popup.grab_set()
+    popup.lift()
+    popup.focus_force()
+    popup.attributes('-topmost', True)
+    
+    popup.update_idletasks()
+    x = (popup.winfo_screenwidth() // 2) - (600 // 2)
+    y = (popup.winfo_screenheight() // 2) - (500 // 2)
+    popup.geometry(f"+{x}+{y}")
+    
+    header_frame = ctk.CTkFrame(popup, fg_color="#e67e22")
+    header_frame.pack(fill="x", padx=0, pady=0)
+    
+    ctk.CTkLabel(header_frame, text="🧰 PICK UP STENCIL FROM STORAGE", 
+                 font=ctk.CTkFont(size=16, weight="bold"),
+                 text_color="white").pack(pady=15)
+    
+    info_frame = ctk.CTkFrame(popup)
+    info_frame.pack(fill="x", padx=20, pady=15)
+    
+    ctk.CTkLabel(info_frame, text=f"Stencil: {stencil_id}", 
+                font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=4)
+    ctk.CTkLabel(info_frame, text=f"Assigned Line: {production_line}").pack(anchor="w", pady=2)
+    ctk.CTkLabel(info_frame, text="Status: In Use").pack(anchor="w", pady=2)
+    
+    storage_frame = ctk.CTkFrame(popup, fg_color="#fef9e7", corner_radius=8)
+    storage_frame.pack(fill="x", padx=20, pady=10)
+    
+    ctk.CTkLabel(storage_frame, text="📍 STORAGE LOCATION:", 
+                font=ctk.CTkFont(weight="bold")).pack(pady=(12, 5))
+    
+    location_label = ctk.CTkLabel(storage_frame, text=f"ROW {storage_row}",
+                                font=ctk.CTkFont(size=22, weight="bold"),
+                                text_color="#e67e22")
+    location_label.pack(pady=12)
+    
+    checklist_frame = ctk.CTkFrame(popup)
+    checklist_frame.pack(fill="x", padx=20, pady=10)
+    
+    ctk.CTkLabel(checklist_frame, text="📋 REQUIRED ACTIONS:", 
+                font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=8)
+    
+    actions = [
+        f"• Locate stencil at Row {storage_row}",
+        "• Verify stencil number and condition",
+        f"• Take to {production_line} for setup",
+        "• Confirm pickup matches system record"
+    ]
+    
+    for action in actions:
+        ctk.CTkLabel(checklist_frame, text=action).pack(anchor="w", pady=3)
+    
+    button_frame = ctk.CTkFrame(popup, fg_color="transparent")
+    button_frame.pack(pady=20)
+    
+    def on_acknowledge():
+        popup.destroy()
+    
+    acknowledge_btn = ctk.CTkButton(button_frame, 
+                                  text="ACKNOWLEDGE & CLOSE", 
+                                  command=on_acknowledge,
+                                  width=180, 
+                                  height=45,
+                                  fg_color="#e67e22",
+                                  hover_color="#d35400",
+                                  font=ctk.CTkFont(weight="bold"))
+    acknowledge_btn.pack(pady=5)
+    
+    popup.after(100, acknowledge_btn.focus_set)
+    popup.bind('<Return>', lambda e: on_acknowledge())
+
+# ---------- SmallDatePicker (CTkToplevel) ----------
+class SmallDatePicker(ctk.CTkToplevel):
+    def __init__(self, master, target_var: tk.StringVar, init_date=None):
+        super().__init__(master)
+        self.title("Pick a date")
+        self.resizable(False, False)
+        self.target_var = target_var
+
+        self.transient(master)
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+
+        today = datetime.today()
+        self.year = today.year
+        self.month = today.month
+        self.day = today.day
+
+        try:
+            if init_date:
+                d = datetime.strptime(init_date, "%Y-%m-%d")
+                self.year, self.month, self.day = d.year, d.month, d.day
+            else:
+                if self.target_var.get():
+                    d = datetime.strptime(self.target_var.get(), "%Y-%m-%d")
+                    self.year, self.month, self.day = d.year, d.month, d.day
+        except Exception:
+            pass
+
+        ctl = ctk.CTkFrame(self)
+        ctl.pack(fill="x", padx=8, pady=6)
+
+        self.prev_btn = ctk.CTkButton(ctl, text="◀", width=40, command=self.prev_month)
+        self.prev_btn.pack(side="left", padx=(0,6))
+
+        self.title_lbl = ctk.CTkLabel(ctl, text="", font=ctk.CTkFont(size=11, weight="bold"))
+        self.title_lbl.pack(side="left", expand=True)
+
+        self.next_btn = ctk.CTkButton(ctl, text="▶", width=40, command=self.next_month)
+        self.next_btn.pack(side="right", padx=(6,0))
+
+        self.grid_frame = ctk.CTkFrame(self)
+        self.grid_frame.pack(padx=8, pady=(6, 8))
+
+        self.build_calendar()
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def prev_month(self):
+        if self.month == 1:
+            self.month = 12
+            self.year -= 1
+        else:
+            self.month -= 1
+        self.build_calendar()
+
+    def next_month(self):
+        if self.month == 12:
+            self.month = 1
+            self.year += 1
+        else:
+            self.month += 1
+        self.build_calendar()
+
+    def build_calendar(self):
+        for w in self.grid_frame.winfo_children():
+            w.destroy()
+
+        self.title_lbl.configure(text=f"{calendar.month_name[self.month]} {self.year}")
+
+        for i, wd in enumerate(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]):
+            lbl = ctk.CTkLabel(self.grid_frame, text=wd, font=ctk.CTkFont(size=10, weight="bold"))
+            lbl.grid(row=0, column=i, pady=2, padx=2)
+
+        cal = calendar.Calendar(firstweekday=0)
+        rows = 1
+        today = datetime.today()
+        for week in cal.monthdayscalendar(self.year, self.month):
+            for col, day in enumerate(week):
+                if day == 0:
+                    spacer = ctk.CTkLabel(self.grid_frame, text=" ", width=40)
+                    spacer.grid(row=rows, column=col, padx=2, pady=2)
+                else:
+                    dstr = f"{self.year:04d}-{self.month:02d}-{day:02d}"
+                    def make_cmd(s=dstr):
+                        return lambda: self.select_date(s)
+                    is_today = (day == today.day and self.month == today.month and self.year == today.year)
+                    btn = ctk.CTkButton(self.grid_frame, text=str(day), width=36, height=28, command=make_cmd())
+                    if is_today:
+                        btn.configure(fg_color="#d1e7ff")
+                    btn.grid(row=rows, column=col, padx=2, pady=2)
+            rows += 1
+
+    def select_date(self, datestr: str):
+        self.target_var.set(datestr)
+        self.destroy()
+
+# ---------- Optimized Stencil Management System Main Class ----------
+class StencilManagementSystem:
+    def __init__(self, username, role):
+        self.username = username
+        self.role = role
+        
+        # Performance tracking
+        self.last_refresh_time = 0
+        self.refresh_count = 0
+        self.is_refreshing = False
+        self.last_table_refresh = 0
+        self.last_sync_check = 0
+        self.user_scrolling_main = False
+        self.user_scrolling_live = False
+        self._main_scroll_after = None
+        self._live_scroll_after = None
+        # Remember scroll positions (prevent stutter during auto-refresh)
+        self._main_scroll_pos = 0.0
+        self._live_scroll_pos = 0.0
+
+
+        
+        load_theme_safe()
+        self.root = ctk.CTk()
+        set_window_icon(self.root)
+        self.root.title("Lumileds Engineering Stencil Management System")
+        self.root.geometry("1280x800")
+        
+        # Initialize windows
+        self.live_window = None
+        self.live_tree = None
+        self.activity_window = None
+        self.activity_tree = None
+        
+        # Filter variables
+        self.filter_sid = ""
+        self.filter_op = ""
+        self.filter_model = ""
+        self.filter_pcb = ""
+
+        #debounce handle for search
+        self._search_after_id = None
+        
+        # Sync status
+        self.sync_status_var = tk.StringVar(value="🟢 Synced")
+        
+        self.setup_gui()
+
+    def auto_refresh(self):
+        """
+        Entry point for the smart periodic refresh loop.
+        Kept for compatibility with existing calls.
+        """
+        # Delegate everything to the optimized scheduler
+        self.smart_periodic_refresh()  
+
+        
+    def setup_gui(self):
+        # Configure ttk style for better performance
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview", 
+                        rowheight=28,
+                        font=('Segoe UI', 9),
+                        background="#ffffff",
+                        fieldbackground="#ffffff")
+        style.configure("Treeview.Heading", 
+                        font=('Segoe UI', 10, 'bold'),
+                        background="#f0f0f0")
+
+        # ------------------ Modern Header with Single Overview Card ------------------
+        header_frame = ctk.CTkFrame(self.root, height=80, corner_radius=0, fg_color="#2b7de9")
+        header_frame.pack(fill="x", padx=0, pady=0)
+
+        header_frame.grid_columnconfigure(0, weight=1)
+        header_frame.grid_columnconfigure(1, weight=1)
+        header_frame.grid_columnconfigure(2, weight=1)
+
+        # -------- Left: Title --------
+        left_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        left_frame.grid(row=0, column=0, sticky="w", padx=20, pady=12)
+
+        header_label = ctk.CTkLabel(
+            left_frame,
+            text="🏭 STENCIL MANAGEMENT SYSTEM",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color="white"
+        )
+        header_label.pack(anchor="w")
+
+        # -------- Center: ONE Rounded Overview Card with 3 Columns --------
+        center_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        center_frame.grid(row=0, column=1, sticky="n")
+
+        overview_card = ctk.CTkFrame(
+            center_frame,
+            fg_color="#d9dce3",
+            corner_radius=18
+        )
+        overview_card.pack(pady=4)
+
+        overview_card.grid_columnconfigure(0, weight=1, uniform="ov")
+        overview_card.grid_columnconfigure(1, weight=1, uniform="ov")
+        overview_card.grid_columnconfigure(2, weight=1, uniform="ov")
+
+       # Column 0: READY (NUMBER + FILTER BUTTON)
+        ready_col = ctk.CTkFrame(overview_card, fg_color="transparent")
+        ready_col.grid(row=0, column=0, padx=16, pady=6, sticky="nsew")
+
+        ctk.CTkLabel(
+            ready_col,
+            text="READY",
+            font=ctk.CTkFont(size=10, weight="bold")
+        ).pack(pady=(0, 1))
+
+        # Filter button (click to show only READY / Returned)
+        self.ready_btn = ctk.CTkButton(
+            ready_col,
+            text="Filter",
+            width=70,
+            height=50,
+            fg_color="#22c55e",
+            hover_color="#16a34a",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            command=lambda: self.apply_status_filter("Available")
+        )
+        self.ready_btn.pack(pady=(4, 0))
+
+        # Column 1: IN USE (NUMBER + FILTER BUTTON)
+        inuse_col = ctk.CTkFrame(overview_card, fg_color="transparent")
+        inuse_col.grid(row=0, column=1, padx=16, pady=6, sticky="nsew")
+
+        ctk.CTkLabel(
+            inuse_col,
+            text="IN USE",
+            font=ctk.CTkFont(size=10, weight="bold")
+        ).pack(pady=(0, 1))
+
+        # Filter button
+        self.in_use_btn = ctk.CTkButton(
+            inuse_col,
+            text="Filter",
+            width=70,
+            height=50,
+            fg_color="#f97373",
+            hover_color="#ef4444",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            command=lambda: self.apply_status_filter("In Use")
+        )
+        self.in_use_btn.pack(pady=(4, 0))
+
+        # Column 2: TOTAL (NUMBER + SHOW ALL BUTTON)
+        total_col = ctk.CTkFrame(overview_card, fg_color="transparent")
+        total_col.grid(row=0, column=2, padx=16, pady=6, sticky="nsew")
+
+        ctk.CTkLabel(
+            total_col,
+            text="TOTAL",
+            font=ctk.CTkFont(size=10, weight="bold")
+        ).pack(pady=(0, 1))
+
+        self.total_btn = ctk.CTkButton(
+            total_col,
+            text="Show All",
+            width=70,
+            height=50,
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            command=lambda: self.apply_status_filter(None)  # clear filter
+        )
+        self.total_btn.pack(pady=(4, 0))
+
+
+
+        # -------- Right: User / Logout / Clock --------
+        right_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        right_frame.grid(row=0, column=2, sticky="e", padx=20, pady=12)
+
+        username_label = ctk.CTkLabel(
+            right_frame,
+            text=f"👤 {self.username}",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="white"
+        )
+        username_label.pack(side="left", padx=(0, 8))
+
+        logout_btn = ctk.CTkButton(
+            right_frame,
+            text="Logout",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="white",
+            width=60,
+            height=28,
+            command=self.confirm_logout,
+            fg_color="transparent",
+            hover_color="#1e6dc4",
+            border_width=1,
+            border_color="#ffffff",
+            corner_radius=8
+        )
+        logout_btn.pack(side="left", padx=(0, 8))
+
+        self.clock_label = ctk.CTkLabel(
+            right_frame,
+            text="",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="white"
+        )
+        self.clock_label.pack(side="left")
+
+        # ------------------ Active Users Display ------------------
+        self.active_users_frame = ctk.CTkFrame(self.root, height=30, fg_color="#e8f4fd", corner_radius=6)
+        self.active_users_frame.pack(fill="x", padx=12, pady=(4, 8))
+        self.active_users_frame.pack_propagate(False)
+        
+        # Add sync status indicator
+        self.sync_status_label = ctk.CTkLabel(
+            self.active_users_frame, 
+            textvariable=self.sync_status_var,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#27ae60"
+        )
+        self.sync_status_label.pack(side="left", padx=(10, 5), pady=6)
+        
+        self.active_users_label = ctk.CTkLabel(
+            self.active_users_frame, 
+            text="👥 Checking active users...",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#2c3e50"
+        )
+        self.active_users_label.pack(side="left", padx=5, pady=6)
+        
+        self.refresh_users_btn = ctk.CTkButton(
+            self.active_users_frame,
+            text="🔄 Refresh",
+            width=70,
+            height=22,
+            command=self.manual_refresh_all,
+            fg_color="transparent",
+            hover_color="#d6eaf8",
+            text_color="#2980b9",
+            font=ctk.CTkFont(size=10)
+        )
+        self.refresh_users_btn.pack(side="right", padx=10, pady=6)
+
+        # ------------------ Sidebar ------------------
+        sidebar = ctk.CTkScrollableFrame(self.root, width=220, corner_radius=0)
+        sidebar.pack(fill="y", side="left", anchor="nw")
+
+        SIDEBAR_PADX = 10
+        SIDEBAR_PADY = 6
+
+        def add_sidebar_button(text, cmd, emoji=""):
+            container = ctk.CTkFrame(sidebar, fg_color="#2b7de9", corner_radius=6)
+            container.pack(padx=SIDEBAR_PADX, pady=(SIDEBAR_PADY // 2), fill="x")
+
+            container.grid_columnconfigure(0, weight=0)
+            container.grid_columnconfigure(1, weight=1)
+            container.grid_columnconfigure(2, weight=0)
+
+            lbl_emoji = ctk.CTkLabel(container, text=emoji, text_color="white", font=ctk.CTkFont(size=16))
+            lbl_emoji.grid(row=0, column=0, padx=6, pady=8)
+
+            lbl_text = ctk.CTkLabel(container, text=text, text_color="white", font=ctk.CTkFont(size=13, weight="bold"))
+            lbl_text.grid(row=0, column=2, padx=6)
+
+            container.bind("<Button-1>", lambda e: cmd())
+            lbl_emoji.bind("<Button-1>", lambda e: cmd())
+            lbl_text.bind("<Button-1>", lambda e: cmd())
+
+        # Add buttons with emojis
+        add_sidebar_button("Live Dashboard", lambda: self.open_live_view(), emoji="📊")
+        if self.role == ROLE_ADMIN:
+            add_sidebar_button("Add New Stencil", lambda: self.add_new_stencil(), emoji="➕")
+            add_sidebar_button("Delete Stencil", lambda: self.delete_stencil_popup(), emoji="🗑️")
+            add_sidebar_button("Edit Stencil", lambda: self.edit_stencil_popup(), emoji="✏️")
+            
+        add_sidebar_button("Stencil Timeline", lambda: self.open_stencil_timeline(), emoji="🕒")
+        add_sidebar_button("Statistics", lambda: self.show_statistics(), emoji="📈")
+        add_sidebar_button("Export Data", lambda: self.export_excel(), emoji="📤")
+        add_sidebar_button("Create Backup", lambda: self.create_backup(), emoji="💾")
+        add_sidebar_button("Activity Log", lambda: self.open_activity_log_view(), emoji="📝")
+        add_sidebar_button("Active Users Dashboard", lambda: self.show_detailed_active_users(), emoji="👥")
+        add_sidebar_button("Exit", lambda: self.exit_program(), emoji="❌")
+
+        # ------------------ Main Content Frame ------------------
+        main_frame = ctk.CTkFrame(self.root)
+        main_frame.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # ------------------ Stencil Operations Panel ------------------
+        operations_frame = ctk.CTkFrame(main_frame)
+        operations_frame.pack(fill="x", padx=0, pady=(0, 12))
+
+        ctk.CTkLabel(operations_frame, text="SCAN & UPDATE",
+                    font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=8, pady=(10, 6))
+
+        # Main form for operations
+        form = ctk.CTkFrame(operations_frame)
+        form.pack(fill="x", padx=8, pady=6)
+
+        # Row 1: Stencil ID and Status
+        ctk.CTkLabel(form, text="Stencil/Job Number:").grid(row=0, column=0, padx=(8,6), pady=6, sticky="w")
+        self.stencil_var = tk.StringVar()
+        self.stencil_entry = ctk.CTkEntry(form, textvariable=self.stencil_var, width=200, placeholder_text="Scan or type number")
+        self.stencil_entry.grid(row=0, column=1, padx=6, pady=6, sticky="w")
+        self.stencil_entry.focus_set()
+        self.stencil_entry.bind("<Return>", lambda e: self.apply_update())
+
+        ctk.CTkLabel(form, text="Status:").grid(row=0, column=2, padx=(20,6), pady=6, sticky="w")
+        self.status_var = tk.StringVar(value="In Use")
+        self.status_cb = ctk.CTkComboBox(form, variable=self.status_var, values=STATUS_OPTIONS, width=150)
+        self.status_cb.grid(row=0, column=3, padx=6, pady=6, sticky="w")
+
+        # Row 2: Production Line and Operator
+        ctk.CTkLabel(form, text="Production Line:").grid(row=1, column=0, padx=(8,6), pady=6, sticky="w")
+        self.line_var = tk.StringVar(value="")
+        self.line_cb = ctk.CTkComboBox(form, variable=self.line_var, values=PRODUCTION_LINES, width=200)
+        self.line_cb.grid(row=1, column=1, padx=6, pady=6, sticky="w")
+
+        ctk.CTkLabel(form, text="Operator ID:").grid(row=1, column=2, padx=(20,6), pady=6, sticky="w")
+        self.operator_var = tk.StringVar(value=self.username)
+        self.operator_entry = ctk.CTkEntry(form, textvariable=self.operator_var, width=150, placeholder_text="Operator name")
+        self.operator_entry.grid(row=1, column=3, padx=6, pady=6, sticky="w")
+
+        # Action buttons
+        self.update_btn = ctk.CTkButton(form, text="UPDATE", command=lambda: self.apply_update(), 
+                                      width=90, height=32, fg_color="#27ae60")
+        self.update_btn.grid(row=0, column=4, padx=(25,6), pady=6)
+
+        # ------------------ Search Filters Section ------------------
+        search_frame = ctk.CTkFrame(operations_frame)
+        search_frame.pack(fill="x", padx=8, pady=(0, 8))
+
+        ctk.CTkLabel(
+            search_frame,
+            text="SEARCH FILTERS",
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).pack(anchor="w", padx=4, pady=(4, 2))
+
+        search_row = ctk.CTkFrame(search_frame, fg_color="transparent")
+        search_row.pack(fill="x", padx=4, pady=4)
+
+        search_row.grid_columnconfigure(1, weight=1)
+        search_row.grid_columnconfigure(3, weight=1)
+
+        # Model Name
+        ctk.CTkLabel(search_row, text="Model Name:").grid(
+            row=0, column=0, padx=(4, 6), pady=4, sticky="w"
+        )
+        self.model_search_var = tk.StringVar()
+        self.model_search_entry = ctk.CTkEntry(
+            search_row,
+            textvariable=self.model_search_var,
+            placeholder_text="Type model name"
+        )
+        self.model_search_entry.grid(row=0, column=1, padx=6, pady=4, sticky="ew")
+        self.model_search_entry.bind("<Return>", lambda e: self.apply_box_search())
+
+        # PCB P/N
+        ctk.CTkLabel(search_row, text="PCB P/N:").grid(
+            row=1, column=0, padx=(4, 6), pady=4, sticky="w"
+        )
+        self.pcb_search_var = tk.StringVar()
+        self.pcb_search_entry = ctk.CTkEntry(
+            search_row,
+            textvariable=self.pcb_search_var,
+            placeholder_text="Type PCB P/N"
+        )
+        self.pcb_search_entry.grid(row=1, column=1, padx=6, pady=4, sticky="ew")
+        self.pcb_search_entry.bind("<Return>", lambda e: self.apply_box_search())
+
+        # Search + Reset buttons (right side)
+        btn_frame = ctk.CTkFrame(search_row, fg_color="transparent")
+        btn_frame.grid(row=0, column=3, rowspan=2, padx=(16, 8), pady=4, sticky="e")
+
+        self.Search_btn = ctk.CTkButton(
+            btn_frame,
+            text="SEARCH",
+            command=self.apply_box_search,
+            width=90,
+            height=30
+        )
+        self.Search_btn.pack(side="top", pady=(0, 3), padx=4)
+
+        self.reset_btn = ctk.CTkButton(
+            btn_frame,
+            text="RESET",
+            command=self.clear_box_search,
+            width=90,
+            height=30,
+            fg_color="#6c757d"
+        )
+        self.reset_btn.pack(side="top", pady=(0, 0), padx=4)
+
+        # Configure grid weights
+        for i in range(6):
+            form.grid_columnconfigure(i, weight=0)
+        form.grid_columnconfigure(1, weight=1)
+
+        # ------------------ Data Table ------------------
+        table_frame = ctk.CTkFrame(main_frame)
+        table_frame.pack(fill="both", expand=True, padx=0, pady=(0, 0))
+
+        ctk.CTkLabel(table_frame, text="STENCIL INVENTORY",
+                    font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=8, pady=(10, 6))
+
+        table_card = ctk.CTkFrame(table_frame)
+        table_card.pack(fill="both", expand=True, padx=8, pady=6)
+
+        columns = tuple(COLUMN_ORDER)
+
+        # Scrollbars
+        vscroll = ttk.Scrollbar(table_card, orient="vertical")
+        hscroll = ttk.Scrollbar(table_card, orient="horizontal")
+
+        self.tree = ttk.Treeview(
+            table_card,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            yscrollcommand=vscroll.set,
+            xscrollcommand=hscroll.set,
+            height=12
+        )
+
+        # Detect user scrolling on main table
+        self.tree.bind("<MouseWheel>", self._on_main_scroll)
+        self.tree.bind("<ButtonPress-1>", self._on_main_scroll)
+        self.tree.bind("<ButtonRelease-1>", self._end_main_scroll)
+
+
+
+        vscroll.config(command=self.tree.yview)
+        hscroll.config(command=self.tree.xview)
+
+        vscroll.pack(side="right", fill="y")
+        hscroll.pack(side="bottom", fill="x")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        # Configure tree columns with modern widths
+        column_widths = {
+            "Model Name": 130,
+            "PCB P/N": 90,
+            "Stencil/Job Number": 140,
+            "Product Family": 90,
+            "Quantity": 70,
+            "Thickness": 70,
+            "Fabrication Date": 110,
+            "Status": 90,
+            "Operator": 90,
+            "Production_Line": 110,
+            "Storage_Row": 90,
+            "Last Updated": 150
+        }
+
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, anchor="center", width=column_widths.get(col, 110))
+
+        # Color coding for status options
+        self.COLOR_TAGS = {
+            "In Use": "#ffc7c7",
+            "Returned": "#c7dcff",
+            "Available": "#b7e4c7"
+        }
+
+        # Bind buttons & events
+        self.update_btn.configure(command=self.apply_update)
+        self.operator_entry.bind('<Return>', lambda event: self.apply_update())
+
+        # Initialize active users display and real-time clock
+        self.root.after(100, self.update_active_users_display)
+        self.root.after(100, self.update_clock)
+        
+        # Add focus tracking for auto-refresh
+        self.root.bind("<FocusIn>", self.on_window_focus)
+
+
+    def update_clock(self):
+        """Update clock with real-time seconds"""
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.clock_label.configure(text=current_time)
+        # Update every second for real-time feel
+        self.root.after(1000, self.update_clock)
+
+    def on_window_focus(self, event=None):
+        """Auto-refresh when window gains focus"""
+        if sync_manager.external_changes_detected:
+            self.background_refresh()
+    
+    def manual_refresh_all(self):
+        """Manual refresh triggered by user"""
+        self.sync_status_var.set("🔄 Refreshing...")
+        self.sync_status_label.configure(text_color="#f39c12")
+        self.root.update_idletasks()
+        
+        # Force clear all caches
+        stencil_cache.clear()
+        user_cache.clear()
+        sync_manager.external_changes_detected = True
+        
+        self.refresh_main_table()
+        self.update_active_users_display()
+        
+        self.sync_status_var.set("🟢 Synced")
+        self.sync_status_label.configure(text_color="#27ae60")
+    
+    def background_refresh(self):
+        """Background refresh when external changes detected"""
+        if self.is_refreshing:
+            return
+            
+        print("Background refresh triggered")
+        self.sync_status_var.set("🔄 Syncing...")
+        self.sync_status_label.configure(text_color="#f39c12")
+        
+        # Clear caches and refresh
+        stencil_cache.clear()
+        self.refresh_main_table()
+        
+        self.sync_status_var.set("🟢 Synced")
+        self.sync_status_label.configure(text_color="#27ae60")
+
+    def update_active_users_display(self):
+        """Update the active users display with caching"""
+        try:
+            active_users = get_active_users()
+            current_user_count = len(active_users)
+            
+            # Remove current user from count for display purposes
+            other_users_count = len([user for user in active_users if user != self.username])
+            
+            if other_users_count > 0:
+                user_list = ", ".join([user for user in active_users if user != self.username])
+                display_text = f"👥 {other_users_count} other user(s) active: {user_list}"
+                self.active_users_label.configure(
+                    text=display_text,
+                    text_color="#27ae60"
+                )
+            else:
+                self.active_users_label.configure(
+                    text="👤 Only you are active",
+                    text_color="#7f8c8d"
+                )
+            
+        except Exception as e:
+            self.active_users_label.configure(
+                text="⚠️ Unable to check active users",
+                text_color="#e74c3c"
+            )
+
+    def show_detailed_active_users(self):
+        """Show detailed active users information - optimized"""
+        active_users = get_active_users()
+        pc_name = socket.gethostname()
+        
+        popup = ctk.CTkToplevel(self.root)
+        popup.title("👥 Active Users Dashboard")
+        popup.geometry("450x350")
+        
+        popup.transient(self.root)
+        popup.grab_set()
+        
+        # Header
+        header_frame = ctk.CTkFrame(popup, fg_color="#3498db", corner_radius=6)
+        header_frame.pack(fill="x", padx=16, pady=16)
+        
+        ctk.CTkLabel(
+            header_frame, 
+            text="ACTIVE USERS DASHBOARD", 
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="white"
+        ).pack(pady=12)
+        
+        # Content
+        content_frame = ctk.CTkFrame(popup)
+        content_frame.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        
+        # Current session info
+        current_session = ctk.CTkFrame(content_frame, fg_color="#e8f4fd")
+        current_session.pack(fill="x", padx=8, pady=8)
+        
+        ctk.CTkLabel(
+            current_session, 
+            text="Your Session:", 
+            font=ctk.CTkFont(weight="bold")
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+        
+        ctk.CTkLabel(
+            current_session, 
+            text=f"• User: {self.username}\n• PC: {pc_name}\n• Role: {self.role}"
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+        
+        # Other users
+        other_users_frame = ctk.CTkFrame(content_frame)
+        other_users_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        
+        other_users = [user for user in active_users if user != self.username]
+        
+        if other_users:
+            ctk.CTkLabel(
+                other_users_frame, 
+                text=f"Other Active Users ({len(other_users)}):", 
+                font=ctk.CTkFont(weight="bold")
+            ).pack(anchor="w", padx=8, pady=(8, 4))
+            
+            for user in other_users:
+                user_frame = ctk.CTkFrame(other_users_frame, fg_color="#f8f9fa")
+                user_frame.pack(fill="x", padx=8, pady=2)
+                ctk.CTkLabel(user_frame, text=f"👤 {user}").pack(anchor="w", padx=8, pady=4)
+        else:
+            ctk.CTkLabel(
+                other_users_frame, 
+                text="No other users currently active", 
+                font=ctk.CTkFont(weight="bold")
+            ).pack(expand=True)
+        
+        # Refresh button
+        def refresh_popup():
+            popup.destroy()
+            self.show_detailed_active_users()
+        
+        ctk.CTkButton(
+            popup, 
+            text="🔄 Refresh", 
+            command=refresh_popup,
+            width=90
+        ).pack(pady=8)
+
+    def confirm_logout(self):
+        if messagebox.askyesno("Logout", "Are you sure you want to logout?"):
+            self.smooth_logout()
+
+    def smooth_logout(self):
+        try:
+            # Close all child windows gracefully
+            if self.live_window and self.live_window.winfo_exists():
+                self.live_window.destroy()
+            if self.activity_window and self.activity_window.winfo_exists():
+                self.activity_window.destroy()
+            
+            self.root.destroy()
+            self.restart_login_system()
+            
+        except Exception as e:
+            print(f"Logout error: {e}")
+            try:
+                self.root.destroy()
+            except:
+                pass
+            self.restart_login_system()
+
+    def restart_login_system(self):
+        try:
+            import subprocess
+            import sys
+            import os
+            
+            current_file = os.path.abspath(__file__)
+            python = sys.executable
+            subprocess.Popen([python, current_file])
+            
+        except Exception as e:
+            print(f"Restart error: {e}")
+            messagebox.showinfo("Logout Complete", "You have been logged out successfully.\nPlease restart the application to login again.")
+
+        # ------------------ Optimized Core Stencil System Functions ------------------
+    def apply_box_search(self):
+        """Optimized search with debouncing"""
+        # read text from boxes
+        self.filter_sid   = (self.stencil_var.get() or "").strip().lower()
+        self.filter_model = (self.model_search_var.get() or "").strip().lower()
+        self.filter_pcb   = (self.pcb_search_var.get() or "").strip().lower()
+
+        self.tree.yview_moveto(0)
+
+        # Debounce – cancel old pending refresh
+        if hasattr(self, "_search_after_id") and self._search_after_id:
+            self.root.after_cancel(self._search_after_id)
+
+        # schedule a refresh
+        self._search_after_id = self.root.after(
+            500,
+            lambda: self.refresh_main_table(force=True, reason="search")
+        )
+
+
+    def clear_box_search(self):
+        """Reset all search filters"""
+        self.filter_sid = ""
+        self.filter_model = ""
+        self.filter_pcb = ""
+
+        # clear UI boxes
+        self.stencil_var.set("")
+        self.model_search_var.set("")
+        self.pcb_search_var.set("")
+        self.line_var.set("")
+        self.stencil_entry.focus_set()
+
+        # cancel pending debounced search
+        if hasattr(self, "_search_after_id") and self._search_after_id:
+            self.root.after_cancel(self._search_after_id)
+            self._search_after_id = None
+
+        # full reset refresh
+        self.refresh_main_table(force=True, reason="reset")
+        self.tree.yview_moveto(0)
+
+    def show_search_results_popup(self, filtered_df: pd.DataFrame):
+        if filtered_df is None or filtered_df.empty:
+            messagebox.showinfo("Search Results", "No records found for this filter.")
+            return
+
+        popup = ctk.CTkToplevel(self.root)
+        popup.title("Search Results")
+        popup.geometry("1200x500")
+        popup.transient(self.root)
+        popup.grab_set()
+        popup.lift()
+        popup.focus_force()
+
+        frame = ctk.CTkFrame(popup)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        columns = list(COLUMN_ORDER)
+
+        # Tree + scrollbars
+        tree = ttk.Treeview(frame, columns=columns, show="headings", height=18)
+        vscroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        hscroll = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
+
+        tree.grid(row=0, column=0, sticky="nsew")
+        vscroll.grid(row=0, column=1, sticky="ns")
+        hscroll.grid(row=1, column=0, sticky="ew")
+
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        # Bigger font
+        style = ttk.Style(tree)
+        style.configure("Popup.Treeview", font=("Segoe UI", 14))
+        tree.configure(style="Popup.Treeview")
+
+        # ---------- SORTING SUPPORT ----------
+        sort_state = {}  # remember ascending/descending per column
+
+        def is_float_str(s: str) -> bool:
+            try:
+                float(s)
+                return True
+            except (ValueError, TypeError):
+                return False
+
+        def sort_by(col_name: str):
+            """Safe sort: numeric if all values numeric, else string sort."""
+            col_idx = columns.index(col_name)
+
+            # Collect (value, item_id)
+            rows = []
+            for item_id in tree.get_children(""):
+                vals = tree.item(item_id, "values")
+                value = ""
+                if col_idx < len(vals):
+                    value = vals[col_idx]
+                rows.append((value, item_id))
+
+            # Detect if ALL non-empty values are numeric
+            non_empty_vals = [str(v) for v, _ in rows if str(v) not in ("", None)]
+            all_numeric = bool(non_empty_vals) and all(is_float_str(v) for v in non_empty_vals)
+
+            reverse = sort_state.get(col_name, False)
+
+            if all_numeric:
+                # numeric sort
+                def key_fn(t):
+                    v = t[0]
+                    if v in ("", None):
+                        return float("-inf")  # empty goes first
+                    return float(v)
+            else:
+                # string sort
+                def key_fn(t):
+                    return str(t[0]).lower()
+
+            rows.sort(key=key_fn, reverse=reverse)
+
+            # Reinsert in sorted order
+            for index, (_, item_id) in enumerate(rows):
+                tree.move(item_id, "", index)
+
+            # flip direction next time
+            sort_state[col_name] = not reverse
+
+        # ---------- HEADINGS WITH CLICK-TO-SORT ----------
+        for col in columns:
+            tree.heading(
+                col,
+                text=col,
+                anchor="center",
+                command=lambda c=col: sort_by(c)   # click to sort
+            )
+            tree.column(col, anchor="center", width=100, stretch=True)
+
+        # ---------- INSERT ROWS WITH STATUS COLOUR ----------
+        status_index = columns.index("Status") if "Status" in columns else None
+
+        for _, row in filtered_df.iterrows():
+            values = [str(row.get(col, "")) for col in columns]
+
+            # Determine status text
+            if status_index is not None:
+                status_val = str(row.get("Status", ""))
+            else:
+                status_val = ""
+
+            # Use same COLOR_TAGS as main table
+            color = self.COLOR_TAGS.get(status_val, "white")
+
+            # Use status as tag, so all "In Use" share same style
+            tags = (status_val,) if status_val else ()
+            item_id = tree.insert("", "end", values=values, tags=tags)
+
+            if status_val:
+                tree.tag_configure(status_val, background=color)
+
+        # ---------- SAFE AUTO-FIT WIDTH ----------
+        popup.update_idletasks()  # make sure geometry is up to date
+
+        for col in columns:
+            col_idx = columns.index(col)
+
+            max_chars = len(col)  # start from header length
+
+            for item in tree.get_children():
+                vals = tree.item(item, "values")
+                if col_idx < len(vals):
+                    text = str(vals[col_idx])
+                    if len(text) > max_chars:
+                        max_chars = len(text)
+
+            width_px = max(80, max_chars * 8)  # rough char->px factor
+            tree.column(col, width=width_px)
+
+    def apply_status_filter(self, status):
+        """Filter table by clicking TOTAL / IN USE / READY buttons."""
+        # status can be: None (show all), "In Use", "Available" (or "Returned" if your ready = returned)
+        if status is None:
+            self.filter_status = ""
+        else:
+            self.filter_status = status
+
+        self.refresh_main_table(force=True, reason="status_filter")
+
+    def update_summary(self, full_df: pd.DataFrame):
+        """
+        Update the numbers on the three header buttons.
+        Uses the FULL dataframe (no filters) so numbers don't change
+        when you filter.
+        """
+        if full_df is None or full_df.empty:
+            total = 0
+            in_use = 0
+            # change "Available" to "Returned" here if your READY = Returned instead
+            ready = 0
+        else:
+            counts = full_df["Status"].value_counts()
+            total = int(len(full_df))
+            in_use = int(counts.get("In Use", 0))
+            # 🔴 IMPORTANT: if your DB uses "Returned" instead of "Available" for ready stencils,
+            # change "Available" below to "Returned"
+            ready = int(counts.get("Available", counts.get("Returned", 0)))
+
+        # just numbers on buttons
+        self.total_btn.configure(text=str(total))
+        self.in_use_btn.configure(text=str(in_use))
+        self.ready_btn.configure(text=str(ready))
+
+    def refresh_main_table(self, force=False, reason=""):
+        """Optimized table refresh with filtering + scroll preservation."""
+        current_time = time.time()
+
+        # Skip background refresh if user is scrolling
+        if not force and getattr(self, "user_scrolling_main", False):
+            return
+
+        # Throttle only non-forced refreshes
+        if not force and (current_time - self.last_table_refresh) < MIN_REFRESH_INTERVAL:
+            return
+
+        if self.is_refreshing:
+            return
+
+        self.is_refreshing = True
+        self.last_table_refresh = current_time
+
+        try:
+            # 1) Load full data (from cache/DB)
+            full_df = load_active_df()
+            if full_df is None:
+                full_df = pd.DataFrame(columns=COLUMN_ORDER)
+            full_df = full_df.fillna("")
+
+            # 2) Update the counters using ALL rows
+            self.update_summary(full_df)
+
+            # If nothing in DB -> just clear table and exit
+            if full_df.empty:
+                for item in self.tree.get_children():
+                    self.tree.delete(item)
+                return
+
+            # 3) Start from full_df for DISPLAY
+            local_df = full_df
+
+            # 3a) Apply READY / IN USE header filter
+            if getattr(self, "filter_status", ""):
+                local_df = local_df[local_df["Status"] == self.filter_status]
+
+            # 3b) Apply text search filters
+            if self.filter_sid:
+                m_sid = local_df["Stencil/Job Number"].astype(str).str.lower().str.contains(
+                    self.filter_sid, na=False
+                )
+            else:
+                m_sid = pd.Series(True, index=local_df.index)
+
+            if self.filter_model:
+                m_model = local_df["Model Name"].astype(str).str.lower().str.contains(
+                    self.filter_model, na=False
+                )
+            else:
+                m_model = pd.Series(True, index=local_df.index)
+
+            if self.filter_pcb:
+                m_pcb = local_df["PCB P/N"].astype(str).str.lower().str.contains(
+                    self.filter_pcb, na=False
+                )
+            else:
+                m_pcb = pd.Series(True, index=local_df.index)
+
+            local_df = local_df[m_sid & m_model & m_pcb]
+            # If triggered by search → show popup window
+            if reason == "search":
+                self.show_search_results_popup(local_df)
+
+
+            # 4) Save current scroll position
+            try:
+                self._main_scroll_pos = self.tree.yview()[0]
+            except Exception:
+                self._main_scroll_pos = 0.0
+
+            # 5) Clear table
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+
+            # 6) Insert rows
+            if BATCH_REFRESH_ENABLED and len(local_df) > 100:
+                self._batch_insert_data(local_df)
+            else:
+                self._single_insert_data(local_df)
+
+            # 7) Restore scroll position
+            try:
+                self.tree.yview_moveto(self._main_scroll_pos)
+            except Exception:
+                pass
+
+        finally:
+            self.is_refreshing = False
+
+
+    def _batch_insert_data(self, local_df):
+        """Insert data in batches to prevent UI freezing"""
+        batch_size = 50
+        total_rows = len(local_df)
+        
+        for start_idx in range(0, total_rows, batch_size):
+            end_idx = min(start_idx + batch_size, total_rows)
+            batch_df = local_df.iloc[start_idx:end_idx]
+            
+            for _, r in batch_df.iterrows():
+                values = []
+                for col in COLUMN_ORDER:
+                    value = r.get(col, "")
+                    if pd.isna(value):
+                        value = ""
+                    values.append(str(value))
+                
+                color = self.COLOR_TAGS.get(str(r.get("Status","")), "white")
+                row_tag = f"row_{str(r.get('Stencil/Job Number','')).replace(' ', '_')}"
+                self.tree.insert("", "end", values=values, tags=(row_tag,))
+                self.tree.tag_configure(row_tag, background=color)
+            
+            # Allow UI to update between batches
+            if end_idx < total_rows:
+                self.root.update_idletasks()
+
+    def _single_insert_data(self, local_df):
+        """Insert data normally for smaller datasets"""
+        for _, r in local_df.iterrows():
+            values = []
+            for col in COLUMN_ORDER:
+                value = r.get(col, "")
+                if pd.isna(value):
+                    value = ""
+                values.append(str(value))
+            
+            color = self.COLOR_TAGS.get(str(r.get("Status","")), "white")
+            row_tag = f"row_{str(r.get('Stencil/Job Number','')).replace(' ', '_')}"
+            self.tree.insert("", "end", values=values, tags=(row_tag,))
+            self.tree.tag_configure(row_tag, background=color)
+
+    def update_summary(self, local_df: pd.DataFrame):
+
+        # Count statuses
+        counts = local_df["Status"].value_counts().to_dict()
+
+        # READY = Available
+        available_count_val = counts.get("Available", 0)
+        self.ready_btn.configure(text=str(available_count_val))
+
+        # IN USE = In Use
+        in_use_count_val = counts.get("In Use", 0)
+        self.in_use_btn.configure(text=str(in_use_count_val))
+
+        # TOTAL = total rows
+        total_count_val = len(local_df)
+        self.total_btn.configure(text=str(total_count_val))
+
+    def refresh_live_tree(self):
+        if not self.live_tree:
+            return
+
+        if self.user_scrolling_live:
+            return
+            
+        if self.is_refreshing:
+            return
+            
+        self.is_refreshing = True
+        try:
+            local_df = load_active_df().fillna("")
+
+            # ---- SAVE scroll position ----
+            try:
+                self._live_scroll_pos = self.live_tree.yview()[0]
+            except Exception:
+                self._live_scroll_pos = 0.0
+
+
+            for item in self.live_tree.get_children():
+                self.live_tree.delete(item)
+                
+            # Use batch insertion for live tree too
+            if BATCH_REFRESH_ENABLED and len(local_df) > 100:
+                self._batch_insert_live_data(local_df)
+            else:
+                self._single_insert_live_data(local_df)
+
+            # ---- RESTORE scroll position ----
+            try:
+                self.live_tree.yview_moveto(self._live_scroll_pos)
+            except Exception:
+                pass
+
+        finally:
+            self.is_refreshing = False
+
+    def _batch_insert_live_data(self, local_df):
+        """Batch insert for live tree"""
+        batch_size = 50
+        total_rows = len(local_df)
+        
+        for start_idx in range(0, total_rows, batch_size):
+            end_idx = min(start_idx + batch_size, total_rows)
+            batch_df = local_df.iloc[start_idx:end_idx]
+            
+            for _, r in batch_df.iterrows():
+                color = self.COLOR_TAGS.get(str(r.get("Status","")), "white")
+                values = []
+                for col in COLUMN_ORDER:
+                    value = r.get(col, "")
+                    if pd.isna(value):
+                        value = ""
+                    values.append(str(value))
+                
+                row_tag = f"live_{str(r.get('Stencil/Job Number','')).replace(' ', '_')}"
+                self.live_tree.insert("", "end", values=values, tags=(row_tag,))
+                self.live_tree.tag_configure(row_tag, background=color)
+            
+            if end_idx < total_rows:
+                self.live_tree.update_idletasks()
+
+    def _single_insert_live_data(self, local_df):
+        """Single insert for live tree"""
+        for _, r in local_df.iterrows():
+            color = self.COLOR_TAGS.get(str(r.get("Status","")), "white")
+            values = []
+            for col in COLUMN_ORDER:
+                value = r.get(col, "")
+                if pd.isna(value):
+                    value = ""
+                values.append(str(value))
+            
+            row_tag = f"live_{str(r.get('Stencil/Job Number','')).replace(' ', '_')}"
+            self.live_tree.insert("", "end", values=values, tags=(row_tag,))
+            self.live_tree.tag_configure(row_tag, background=color)
+
+    def smart_periodic_refresh(self):
+        """Smart refresh: only reload if SQLite file changed."""
+        global LAST_KNOWN_MTIME
+
+        db_path = get_stencil_db_path()
+
+        # 1) Check if file exists
+        if not os.path.exists(db_path):
+            self.root.after(REFRESH_MS, self.smart_periodic_refresh)
+            return
+
+        try:
+            # 2) Get current modified time
+            current_mtime = os.path.getmtime(db_path)
+        except Exception:
+            # Cannot read timestamp, skip
+            self.root.after(REFRESH_MS, self.smart_periodic_refresh)
+            return
+
+        # 3) Compare with last known timestamp
+        if current_mtime != LAST_KNOWN_MTIME:
+            # Something changed → update UI
+            LAST_KNOWN_MTIME = current_mtime
+            self.refresh_main_table(force=True, reason="db_changed")
+            self.refresh_live_tree()
+
+        # Schedule next check
+        self.root.after(REFRESH_MS, self.smart_periodic_refresh)
+
+
+    def _instant_local_refresh(self, reason="local_change"):
+        """Force refresh UI immediately after a local DB change."""
+        try:
+            # Clear cache for active stencils so load_active_df() reads fresh data
+            stencil_cache.clear()
+
+            # Refresh main table instantly
+            self.refresh_main_table(force=True, reason=reason)
+
+            # If live dashboard is open, refresh it too
+            if self.live_window and self.live_tree:
+                self.refresh_live_tree()
+        except Exception as e:
+            print(f"Instant local refresh error: {e}")
+
+    def apply_update(self):
+        """Update status/operator for an existing stencil with FIXED storage location."""
+        sid = (self.stencil_var.get() or "").strip()
+        status = self.status_var.get()
+        operator = (self.operator_var.get() or "").strip()
+        production_line = self.line_var.get()
+
+        if not sid:
+            messagebox.showwarning("Missing Info", "Please enter/scan a Stencil/Job Number.")
+            self.stencil_entry.focus_set()
+            return
+        if not operator:
+            messagebox.showwarning("Missing Info", "Please enter Operator ID.")
+            self.operator_entry.focus_set()
+            return
+
+        # Validate production line for In Use status
+        if status == "In Use" and not production_line:
+            messagebox.showwarning("Missing Info", "Please select Production Line for 'In Use' status.")
+            self.line_cb.focus_set()
+            return
+
+        # Check if stencil exists
+        if not stencil_exists(sid):
+            messagebox.showerror(
+                "Not Found",
+                f"Stencil/Job Number '{sid}' does not exist.\nUse 'Add New Stencil' to create it."
+            )
+            self.stencil_entry.focus_set()
+            return
+
+        # Get current stencil data
+        current_stencil = get_stencil(sid)
+        if not current_stencil:
+            messagebox.showerror("Error", f"Cannot load stencil '{sid}' data.")
+            return
+
+        current_status = current_stencil.get('status', '')
+        current_line = current_stencil.get('production_line', '')
+        current_storage = current_stencil.get('storage_row', '')  # Permanent storage
+
+        now = now_ts()
+
+        # Handle Returned status - automatically change to Available internally
+        if status == "Returned":
+            # Update to Returned - KEEP Storage_Row intact (never clear it)
+            stencil_data = {
+                'stencil_job_number': sid,
+                'model_name': current_stencil.get('model_name', ''),
+                'pcb_part_number': current_stencil.get('pcb_part_number', ''),
+                'product_family': current_stencil.get('product_family', ''),
+                'quantity': current_stencil.get('quantity', ''),
+                'thickness': current_stencil.get('thickness', ''),
+                'fabrication_date': current_stencil.get('fabrication_date', ''),
+                'status': 'Returned',
+                'operator': operator,
+                'production_line': '',  # Clear production line on return
+                'storage_row': current_storage,  # Keep permanent storage
+                'last_updated': now
+            }
+            
+            if save_stencil(stencil_data):
+                # Enhanced logging for return
+                log_activity(
+                    operator=operator, 
+                    action_type="RETURNED_FROM_USE", 
+                    stencil_job_number=sid, 
+                    from_status=current_status,
+                    to_status="Returned",
+                    production_line=current_line,
+                    storage_location=current_storage,
+                    description=f"Stencil returned from {current_line} to storage location {current_storage}"
+                )
+                
+                # Now automatically change to Available internally - STILL keep Storage_Row
+                stencil_data['status'] = 'Available'
+                stencil_data['last_updated'] = now_ts()
+                
+                if save_stencil(stencil_data):
+                    # Log the automatic availability
+                    log_activity(
+                        operator="System", 
+                        action_type="AUTO_AVAILABLE", 
+                        stencil_job_number=sid, 
+                        from_status="Returned",
+                        to_status="Available",
+                        storage_location=current_storage,
+                        description=f"Automatically available for next use in storage location {current_storage}"
+                    )
+                    
+                    # Show enhanced modal popup with ORIGINAL storage location
+                    show_storage_instruction(sid, current_line, current_storage, self.root)
+                    
+                    # Clear form
+                    self.stencil_var.set("")
+                    self.operator_var.set(self.username)
+                    self.line_var.set("")
+                    self.stencil_entry.focus_set()
+                    
+                    self._instant_local_refresh("update")
+                else:
+                    messagebox.showerror("Save Failed", "Could not save automatic availability update.")
+            else:
+                messagebox.showerror("Save Failed", "Could not save return status.")
+        
+        else:
+            # Status update to "In Use" - KEEP Storage_Row intact (never clear it)
+            if status == "In Use":
+                stencil_data = {
+                    'stencil_job_number': sid,
+                    'model_name': current_stencil.get('model_name', ''),
+                    'pcb_part_number': current_stencil.get('pcb_part_number', ''),
+                    'product_family': current_stencil.get('product_family', ''),
+                    'quantity': current_stencil.get('quantity', ''),
+                    'thickness': current_stencil.get('thickness', ''),
+                    'fabrication_date': current_stencil.get('fabrication_date', ''),
+                    'status': 'In Use',
+                    'operator': operator,
+                    'production_line': production_line,
+                    'storage_row': current_storage,  # Keep permanent storage
+                    'last_updated': now
+                }
+
+                if save_stencil(stencil_data):
+                    # Enhanced logging for pickup
+                    log_activity(
+                        operator=operator, 
+                        action_type="PICKUP_FROM_STORAGE", 
+                        stencil_job_number=sid, 
+                        from_status=current_status,
+                        to_status="In Use",
+                        production_line=production_line,
+                        storage_location=current_storage,
+                        description=f"Picked up stencil from Row {current_storage} for production use on {production_line}"
+                    )
+                    
+                    # Show pickup instruction popup
+                    show_pickup_instruction(sid, production_line, current_storage, self.root)
+                    
+                    # Clear form
+                    self.stencil_var.set("")
+                    self.operator_var.set(self.username)
+                    self.line_var.set("")
+                    self.stencil_entry.focus_set()
+                    
+                    self._instant_local_refresh("update")
+                else:
+                    messagebox.showerror("Save Failed", "Could not save data.")
+
+    def export_excel(self):
+        """Export data to Excel for audit purposes"""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialfile=f"stencil_export_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        )
+        if path:
+            try:
+                active_df = load_active_df()
+                deleted_df = load_deleted_df()
+                activity_df = load_activity_df()
+                
+                with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                    active_df.to_excel(writer, sheet_name="Active_Stencils", index=False)
+                    deleted_df.to_excel(writer, sheet_name="Deleted_Log", index=False)
+                    activity_df.to_excel(writer, sheet_name="Activity_Log", index=False)
+                
+                op = self.operator_var.get().strip() or "Unknown"
+                log_activity(
+                    operator=op, 
+                    action_type="EXPORT", 
+                    description=f"Exported workbook to {os.path.basename(path)}"
+                )
+                messagebox.showinfo("Exported", f"Export saved to:\n{path}")
+            except Exception as e:
+                messagebox.showerror("Export Failed", f"Cannot export: {e}")
+
+    def create_backup(self):
+        """Create timestamped backup of the stencil database with network preference"""
+        try:
+            source_db = get_stencil_db_path()
+
+            if not source_db.exists():
+                messagebox.showerror("Backup Failed", "Stencil DB not found.")
+                return
+
+            # Try network backup first, fallback to local
+            backup_dir = get_network_backup_dir()
+            if not backup_dir:
+                # Network unavailable, use local backup
+                backup_dir = user_data_dir() / "backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = backup_dir / f"stencil_backup_{timestamp}.db"
+
+            # Copy DB to backup
+            shutil.copy2(source_db, backup_file)
+
+            # Keep only the newest 10 by filename (YYYYMMDD_HHMMSS sorts correctly)
+            backups = sorted(backup_dir.glob("stencil_backup_*.db"))
+            for old in backups[:-10]:
+                try:
+                    old.unlink()
+                except Exception:
+                    pass  # ignore if locked or in use
+
+            location_type = "Network" if "MYGBYNBYN1FD797" in str(backup_file) else "Local"
+            messagebox.showinfo("Backup Created", f"Backup saved to {location_type} storage:\n{backup_file}")
+
+            # Log the backup
+            try:
+                log_activity(
+                    operator="System",
+                    action_type="BACKUP",
+                    description=f"Created {location_type.lower()} backup: {backup_file.name}"
+                )
+            except Exception:
+                # Don't block the UI if logging fails
+                pass
+
+        except Exception as e:
+            messagebox.showerror("Backup Failed", f"Could not create backup:\n{e}")
+
+    def show_statistics(self):
+        stats_popup = ctk.CTkToplevel(self.root)
+        stats_popup.title("System Statistics")
+        stats_popup.geometry("500x600")
+        
+        stats_popup.transient(self.root)
+        stats_popup.grab_set()
+        stats_popup.lift()
+        stats_popup.focus_force()
+        
+        df = load_active_df()
+        activity_df = load_activity_df()
+        
+        # Calculate statistics
+        total_stencils = len(df)
+        status_counts = df["Status"].value_counts()
+        
+        # Enhanced status counts for display
+        in_use_count_val = status_counts.get('In Use', 0)
+        returned_count_val = status_counts.get('Returned', 0)
+        available_count_val = status_counts.get('Available', 0) + returned_count_val
+        
+        family_counts = df["Product Family"].value_counts()
+        
+        # Most active operator
+        top_operator = activity_df["Operator"].value_counts().head(3)
+        
+        # Recent activity
+        recent_activity = activity_df.head(10)
+        
+        # Create statistics display
+        stats_text = f"""
+    📊 SYSTEM STATISTICS
+    {'='*40}
+    
+    Total Stencils: {total_stencils}
+    
+    📍 Status Distribution:
+      • Ready to Use: {available_count_val}
+      • In Production: {in_use_count_val}
+      • Recently Returned: {returned_count_val}
+    
+    🏷️ Product Family Distribution:
+    {chr(10).join([f'    • {family}: {count}' for family, count in family_counts.head(5).items()])}
+    
+    👥 Most Active Operators:
+    {chr(10).join([f'    • {op}: {count} actions' for op, count in top_operator.items()])}
+    
+    🔄 Recent Activity:
+    """
+        
+        # Add recent activity
+        for _, activity in recent_activity.iterrows():
+            stats_text += f"\n    • {activity['Date & Time']} - {activity['Operator']}: {activity['Action Type']}"
+        
+        stats_text += f"\n\n🕒 Last Updated: {now_ts()}"
+        
+        text_widget = ctk.CTkTextbox(stats_popup, font=ctk.CTkFont(family="Consolas", size=12))
+        text_widget.pack(fill="both", expand=True, padx=20, pady=20)
+        text_widget.insert("1.0", stats_text)
+        text_widget.configure(state="disabled")
+
+    def open_stencil_timeline(self):
+        timeline_popup = ctk.CTkToplevel(self.root)
+        timeline_popup.title("Stencil Timeline Viewer")
+        timeline_popup.geometry("800x600")
+        
+        timeline_popup.transient(self.root)
+        timeline_popup.grab_set()
+        timeline_popup.lift()
+        timeline_popup.focus_force()
+        
+        # Stencil selection
+        selection_frame = ctk.CTkFrame(timeline_popup)
+        selection_frame.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(selection_frame, text="Select Stencil:", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=5)
+        
+        stencil_list = load_active_df()["Stencil/Job Number"].dropna().astype(str).str.strip().sort_values().tolist()
+        selected_stencil = tk.StringVar()
+        stencil_combo = ctk.CTkComboBox(selection_frame, variable=selected_stencil, values=stencil_list, width=200)
+        stencil_combo.pack(side="left", padx=10)
+        
+        timeline_text = ctk.CTkTextbox(timeline_popup, font=ctk.CTkFont(family="Consolas", size=11))
+        timeline_text.pack(fill="both", expand=True, padx=20, pady=10)
+        
+        def load_timeline():
+            stencil_id = selected_stencil.get()
+            if not stencil_id:
+                return
+                
+            activity_df = load_activity_df()
+            stencil_activities = activity_df[activity_df["Stencil/Job Number"] == stencil_id].sort_values("Date & Time")
+            
+            if stencil_activities.empty:
+                timeline_text.delete("1.0", "end")
+                timeline_text.insert("1.0", f"No activity found for stencil: {stencil_id}")
+                return
+            
+            current_stencil = get_stencil(stencil_id)
+            
+            timeline_output = f"🕒 TIMELINE FOR: {stencil_id}\n"
+            timeline_output += "="*50 + "\n\n"
+            
+            if current_stencil:
+                timeline_output += f"📋 CURRENT STATUS:\n"
+                timeline_output += f"   • Model: {current_stencil.get('model_name', 'N/A')}\n"
+                timeline_output += f"   • Status: {current_stencil.get('status', 'N/A')}\n"
+                timeline_output += f"   • Production Line: {current_stencil.get('production_line', 'N/A')}\n"
+                timeline_output += f"   • Storage Location: {current_stencil.get('storage_row', 'N/A')}\n"
+                timeline_output += f"   • Last Updated: {current_stencil.get('last_updated', 'N/A')}\n\n"
+            
+            timeline_output += "📜 ACTIVITY HISTORY:\n"
+            
+            for _, activity in stencil_activities.iterrows():
+                timeline_output += f"\n📅 {activity['Date & Time']}\n"
+                timeline_output += f"   👤 {activity['Operator']}\n"
+                timeline_output += f"   🔄 {activity['Action Type']}\n"
+                if activity['From_Status'] and activity['To_Status']:
+                    timeline_output += f"   📊 {activity['From_Status']} → {activity['To_Status']}\n"
+                if activity['Production_Line']:
+                    timeline_output += f"   🏭 Line: {activity['Production_Line']}\n"
+                if activity['Storage_Location']:
+                    timeline_output += f"   📍 Storage: {activity['Storage_Location']}\n"
+                if activity['Detailed_Description']:
+                    timeline_output += f"   📝 {activity['Detailed_Description']}\n"
+                timeline_output += "   " + "-"*40
+            
+            timeline_text.delete("1.0", "end")
+            timeline_text.insert("1.0", timeline_output)
+        
+        ctk.CTkButton(selection_frame, text="Load Timeline", command=load_timeline).pack(side="left", padx=10)
+        stencil_combo.bind("<<ComboboxSelected>>", lambda e: load_timeline())
+
+    def add_new_stencil(self):
+        popup = ctk.CTkToplevel(self.root)
+        popup.title("Add New Stencil")
+        popup.geometry("760x480")
+        popup.minsize(740, 450)
+
+        popup.transient(self.root)
+        popup.grab_set()
+        popup.lift()
+        popup.focus_force()
+
+        title = ctk.CTkLabel(popup, text="Add New Stencil", font=ctk.CTkFont(size=16, weight="bold"))
+        title.grid(row=0, column=0, columnspan=4, pady=(12, 10), padx=12)
+
+        form = ctk.CTkFrame(popup)
+        form.grid(row=1, column=0, columnspan=4, sticky="nsew", padx=18)
+
+        for c in (1, 3):
+            form.grid_columnconfigure(c, weight=1)
+
+        # Field vars
+        v_model = tk.StringVar()
+        v_pcb  = tk.StringVar()
+        v_sid  = tk.StringVar()
+        v_pf   = tk.StringVar(value=PRODUCT_FAMILIES[0])
+        v_qty  = tk.StringVar()
+        v_thk  = tk.StringVar()
+        v_fab  = tk.StringVar()
+        v_storage_row = tk.StringVar()
+        v_op   = tk.StringVar(value=self.username)
+
+        # Row 0
+        ctk.CTkLabel(form, text="Model Name:").grid(row=0, column=0, sticky="w", padx=(0,8), pady=6)
+        e_model = ctk.CTkEntry(form, textvariable=v_model)
+        e_model.grid(row=0, column=1, sticky="ew", pady=6)
+
+        ctk.CTkLabel(form, text="PCB P/N:").grid(row=0, column=2, sticky="w", padx=(18,8), pady=6)
+        e_pcb = ctk.CTkEntry(form, textvariable=v_pcb)
+        e_pcb.grid(row=0, column=3, sticky="ew", pady=6)
+
+        # Row 1
+        ctk.CTkLabel(form, text="Stencil/Job Number:").grid(row=1, column=0, sticky="w", padx=(0,8), pady=6)
+        e_sid = ctk.CTkEntry(form, textvariable=v_sid)
+        e_sid.grid(row=1, column=1, sticky="ew", pady=6)
+
+        ctk.CTkLabel(form, text="Product Family:").grid(row=1, column=2, sticky="w", padx=(18,8), pady=6)
+        cb_pf = ctk.CTkComboBox(form, variable=v_pf, values=PRODUCT_FAMILIES, width=220)
+        cb_pf.grid(row=1, column=3, sticky="ew", pady=6)
+
+        # Row 2
+        ctk.CTkLabel(form, text="Quantity:").grid(row=2, column=0, sticky="w", padx=(0,8), pady=6)
+        e_set = ctk.CTkEntry(form, textvariable=v_qty)
+        e_set.grid(row=2, column=1, sticky="ew", pady=6)
+
+        ctk.CTkLabel(form, text="Thickness:").grid(row=2, column=2, sticky="w", padx=(18,8), pady=6)
+        e_thk = ctk.CTkEntry(form, textvariable=v_thk)
+        e_thk.grid(row=2, column=3, sticky="ew", pady=6)
+
+        # Row 3
+        ctk.CTkLabel(form, text="Fabrication Date:").grid(row=3, column=0, sticky="w", padx=(0,8), pady=6)
+        fab_row = ctk.CTkFrame(form)
+        fab_row.grid(row=3, column=1, sticky="ew", pady=6)
+        fab_row.grid_columnconfigure(0, weight=1)
+        e_fab = ctk.CTkEntry(fab_row, textvariable=v_fab)
+        e_fab.grid(row=0, column=0, sticky="ew")
+
+        def open_cal_for_add():
+            SmallDatePicker(popup, v_fab, init_date=v_fab.get())
+        cal_btn = ctk.CTkButton(fab_row, text="📅", width=36, command=open_cal_for_add)
+        cal_btn.grid(row=0, column=1, padx=(6,0))
+
+        ctk.CTkLabel(form, text="Storage Location:").grid(row=3, column=2, sticky="w", padx=(18,8), pady=6)
+        e_storage = ctk.CTkEntry(form, textvariable=v_storage_row)
+        e_storage.grid(row=3, column=3, sticky="ew", pady=6)
+
+        # Row 4: Operator only
+        ctk.CTkLabel(form, text="Operator ID:").grid(row=4, column=0, sticky="w", padx=(0,8), pady=6)
+        e_op = ctk.CTkEntry(form, textvariable=v_op)
+        e_op.grid(row=4, column=1, sticky="ew", pady=6)
+
+        ctk.CTkLabel(form, text="Tip: use YYYY-MM-DD for date (click 📅 to pick)", text_color="#7f8c8d").grid(
+            row=5, column=0, columnspan=4, sticky="w", pady=(2, 10)
+        )
+
+        def save_new_stencil():
+            sid = v_sid.get().strip()
+            if not sid:
+                messagebox.showwarning("Missing Info", "Please enter a Stencil/Job Number.")
+                e_sid.focus_set(); return
+            if not v_op.get().strip():
+                messagebox.showwarning("Missing Info", "Please enter Operator ID.")
+                e_op.focus_set(); return
+
+            if v_fab.get().strip():
+                try:
+                    datetime.strptime(v_fab.get().strip(), "%Y-%m-%d")
+                except ValueError:
+                    messagebox.showerror("Invalid Date", "Fabrication Date must be YYYY-MM-DD.")
+                    e_fab.focus_set(); return
+
+            if stencil_exists(sid):
+                messagebox.showerror("Duplicate", f"Stencil/Job Number '{sid}' already exists.")
+                e_sid.focus_set(); return
+
+            # Create new stencil with Available status by default
+            stencil_data = {
+                'stencil_job_number': sid,
+                'model_name': v_model.get().strip(),
+                'pcb_part_number': v_pcb.get().strip(),
+                'product_family': v_pf.get(),
+                'quantity': v_qty.get().strip(),
+                'thickness': v_thk.get().strip(),
+                'fabrication_date': v_fab.get().strip(),
+                'status': 'Available',  # New stencils start as Available
+                'operator': v_op.get().strip(),
+                'production_line': '',  # Empty for new stencils
+                'storage_row': v_storage_row.get().strip(),  # Permanent storage location
+                'last_updated': now_ts()
+            }
+
+            if save_stencil(stencil_data):
+                # Log the creation
+                log_activity(
+                    operator=v_op.get().strip(),
+                    action_type="CREATED",
+                    stencil_job_number=sid,
+                    from_status="",
+                    to_status="Available",
+                    storage_location=v_storage_row.get().strip(),
+                    description=f"New stencil created and stored at Row {v_storage_row.get().strip()}"
+                )
+
+                # 🔹 Instant refresh so the new row appears immediately
+                self._instant_local_refresh(reason="add_new")
+                
+                messagebox.showinfo("Success", f"Stencil '{sid}' added successfully!")
+                popup.destroy()
+                self.refresh_main_table()
+            else:
+                messagebox.showerror("Save Failed", "Could not save new stencil.")
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(popup)
+        btn_frame.grid(row=2, column=0, columnspan=4, sticky="ew", padx=18, pady=12)
+
+        ctk.CTkButton(btn_frame, text="Save New Stencil", command=save_new_stencil,
+                     fg_color="#27ae60", width=140).pack(side="right", padx=(8,0))
+        ctk.CTkButton(btn_frame, text="Cancel", command=popup.destroy,
+                     fg_color="#6c757d", width=100).pack(side="right")
+
+        popup.grid_rowconfigure(1, weight=1)
+        popup.grid_columnconfigure(0, weight=1)
+
+        e_sid.focus_set()
+
+    def delete_stencil_popup(self):
+        popup = ctk.CTkToplevel(self.root)
+        popup.title("Delete Stencil")
+        popup.geometry("500x300")
+        
+        popup.transient(self.root)
+        popup.grab_set()
+        popup.lift()
+        popup.focus_force()
+
+        title = ctk.CTkLabel(popup, text="Delete Stencil Record", font=ctk.CTkFont(size=16, weight="bold"))
+        title.pack(pady=(15, 10))
+
+        form = ctk.CTkFrame(popup)
+        form.pack(fill="x", padx=20, pady=10)
+
+        ctk.CTkLabel(form, text="Stencil/Job Number to Delete:", anchor="w").pack(fill="x", padx=12, pady=(12, 6))
+        v_sid = tk.StringVar()
+        e_sid = ctk.CTkEntry(form, textvariable=v_sid, placeholder_text="Scan or type number")
+        e_sid.pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkLabel(form, text="Remarks (optional):", anchor="w").pack(fill="x", padx=12, pady=(8, 6))
+        v_remarks = tk.StringVar()
+        e_remarks = ctk.CTkEntry(form, textvariable=v_remarks, placeholder_text="Reason for deletion")
+        e_remarks.pack(fill="x", padx=12, pady=(0, 12))
+
+        def do_delete():
+            sid = v_sid.get().strip()
+            remarks = v_remarks.get().strip()
+            operator = self.username
+
+            if not sid:
+                messagebox.showwarning("Missing Info", "Please enter a Stencil/Job Number.")
+                e_sid.focus_set()
+                return
+
+            if not stencil_exists(sid):
+                messagebox.showerror("Not Found", f"Stencil '{sid}' does not exist.")
+                e_sid.focus_set()
+                return
+
+            current_stencil = get_stencil(sid)
+            if not current_stencil:
+                messagebox.showerror("Error", f"Cannot load stencil '{sid}' data.")
+                return
+
+            storage_row = current_stencil.get('storage_row', 'Unknown')
+            
+            if not messagebox.askyesno("Confirm Delete", 
+                                     f"Permanently delete stencil '{sid}'?\nThis action cannot be undone."):
+                return
+
+            # Log before deletion
+            log_activity(
+                operator=operator,
+                action_type="DELETED",
+                stencil_job_number=sid,
+                from_status=current_stencil.get('status', ''),
+                to_status="Deleted",
+                storage_location=storage_row,
+                description=f"Stencil deleted from storage Row {storage_row}. Remarks: {remarks}"
+            )
+
+            # Archive to deleted_stencils
+            log_deleted(operator, sid, storage_row, remarks)
+
+            # 🔹 Instant refresh so the deleted row disappears
+            self._instant_local_refresh(reason="delete")
+
+            # Delete from active stencils
+            if delete_stencil(sid):
+                messagebox.showinfo("Success", f"Stencil '{sid}' deleted and archived.")
+                popup.destroy()
+                self.refresh_main_table()
+            else:
+                messagebox.showerror("Delete Failed", "Could not delete stencil from database.")
+
+        btn_frame = ctk.CTkFrame(popup)
+        btn_frame.pack(fill="x", padx=20, pady=10)
+
+        ctk.CTkButton(btn_frame, text="Delete Stencil", command=do_delete,
+                     fg_color="#e74c3c", width=120).pack(side="right", padx=(8,0))
+        ctk.CTkButton(btn_frame, text="Cancel", command=popup.destroy,
+                     fg_color="#6c757d", width=100).pack(side="right")
+
+        e_sid.focus_set()
+
+    def edit_stencil_popup(self):
+        popup = ctk.CTkToplevel(self.root)
+        popup.title("Edit Stencil")
+        popup.geometry("760x500")
+        popup.minsize(740, 470)
+
+        popup.transient(self.root)
+        popup.grab_set()
+        popup.lift()
+        popup.focus_force()
+
+        title = ctk.CTkLabel(popup, text="Edit Stencil Record", font=ctk.CTkFont(size=16, weight="bold"))
+        title.grid(row=0, column=0, columnspan=4, pady=(12, 10), padx=12)
+
+        # Search frame
+        search_frame = ctk.CTkFrame(popup)
+        search_frame.grid(row=1, column=0, columnspan=4, sticky="ew", padx=18, pady=(0, 10))
+
+        ctk.CTkLabel(search_frame, text="Search Stencil/Job Number:").pack(side="left", padx=(12, 8), pady=12)
+        v_search = tk.StringVar()
+        e_search = ctk.CTkEntry(search_frame, textvariable=v_search, width=200, 
+                               placeholder_text="Enter stencil number")
+        e_search.pack(side="left", padx=(0, 8), pady=12)
+
+        def search_stencil():
+            sid = v_search.get().strip()
+            if not sid:
+                return
+
+            stencil = get_stencil(sid)
+            if not stencil:
+                messagebox.showerror("Not Found", f"Stencil '{sid}' not found.")
+                return
+
+            # Populate form with existing data
+            v_model.set(stencil.get('model_name', ''))
+            v_pcb.set(stencil.get('pcb_part_number', ''))
+            v_sid.set(stencil.get('stencil_job_number', ''))
+            v_pf.set(stencil.get('product_family', PRODUCT_FAMILIES[0]))
+            v_qty.set(stencil.get('quantity', ''))
+            v_thk.set(stencil.get('thickness', ''))
+            v_fab.set(stencil.get('fabrication_date', ''))
+            v_storage_row.set(stencil.get('storage_row', ''))
+            v_status.set(stencil.get('status', 'Available'))
+            v_op.set(stencil.get('operator', self.username))
+
+            # Enable save button
+            save_btn.configure(state="normal")
+
+        ctk.CTkButton(search_frame, text="Search", command=search_stencil, width=80).pack(side="left", padx=(0, 12), pady=12)
+
+        # Main form
+        form = ctk.CTkFrame(popup)
+        form.grid(row=2, column=0, columnspan=4, sticky="nsew", padx=18)
+
+        for c in (1, 3):
+            form.grid_columnconfigure(c, weight=1)
+
+        # Field vars
+        v_model = tk.StringVar()
+        v_pcb  = tk.StringVar()
+        v_sid  = tk.StringVar()
+        v_pf   = tk.StringVar(value=PRODUCT_FAMILIES[0])
+        v_qty  = tk.StringVar()
+        v_thk  = tk.StringVar()
+        v_fab  = tk.StringVar()
+        v_storage_row = tk.StringVar()
+        v_status = tk.StringVar(value="Available")
+        v_op   = tk.StringVar(value=self.username)
+
+        # Row 0
+        ctk.CTkLabel(form, text="Model Name:").grid(row=0, column=0, sticky="w", padx=(0,8), pady=6)
+        e_model = ctk.CTkEntry(form, textvariable=v_model)
+        e_model.grid(row=0, column=1, sticky="ew", pady=6)
+
+        ctk.CTkLabel(form, text="PCB P/N:").grid(row=0, column=2, sticky="w", padx=(18,8), pady=6)
+        e_pcb = ctk.CTkEntry(form, textvariable=v_pcb)
+        e_pcb.grid(row=0, column=3, sticky="ew", pady=6)
+
+        # Row 1
+        ctk.CTkLabel(form, text="Stencil/Job Number:").grid(row=1, column=0, sticky="w", padx=(0,8), pady=6)
+        e_sid = ctk.CTkEntry(form, textvariable=v_sid)
+        e_sid.grid(row=1, column=1, sticky="ew", pady=6)
+
+        ctk.CTkLabel(form, text="Product Family:").grid(row=1, column=2, sticky="w", padx=(18,8), pady=6)
+        cb_pf = ctk.CTkComboBox(form, variable=v_pf, values=PRODUCT_FAMILIES, width=220)
+        cb_pf.grid(row=1, column=3, sticky="ew", pady=6)
+
+        # Row 2
+        ctk.CTkLabel(form, text="Quantity:").grid(row=2, column=0, sticky="w", padx=(0,8), pady=6)
+        e_set = ctk.CTkEntry(form, textvariable=v_qty)
+        e_set.grid(row=2, column=1, sticky="ew", pady=6)
+
+        ctk.CTkLabel(form, text="Thickness:").grid(row=2, column=2, sticky="w", padx=(18,8), pady=6)
+        e_thk = ctk.CTkEntry(form, textvariable=v_thk)
+        e_thk.grid(row=2, column=3, sticky="ew", pady=6)
+
+        # Row 3
+        ctk.CTkLabel(form, text="Fabrication Date:").grid(row=3, column=0, sticky="w", padx=(0,8), pady=6)
+        fab_row = ctk.CTkFrame(form)
+        fab_row.grid(row=3, column=1, sticky="ew", pady=6)
+        fab_row.grid_columnconfigure(0, weight=1)
+        e_fab = ctk.CTkEntry(fab_row, textvariable=v_fab)
+        e_fab.grid(row=0, column=0, sticky="ew")
+
+        def open_cal_for_edit():
+            SmallDatePicker(popup, v_fab, init_date=v_fab.get())
+        cal_btn = ctk.CTkButton(fab_row, text="📅", width=36, command=open_cal_for_edit)
+        cal_btn.grid(row=0, column=1, padx=(6,0))
+
+        ctk.CTkLabel(form, text="Storage Location:").grid(row=3, column=2, sticky="w", padx=(18,8), pady=6)
+        e_storage = ctk.CTkEntry(form, textvariable=v_storage_row)
+        e_storage.grid(row=3, column=3, sticky="ew", pady=6)
+
+        # Row 4
+        ctk.CTkLabel(form, text="Status:").grid(row=4, column=0, sticky="w", padx=(0,8), pady=6)
+        cb_status = ctk.CTkComboBox(form, variable=v_status, values=["Available", "In Use", "Returned"])
+        cb_status.grid(row=4, column=1, sticky="ew", pady=6)
+
+        ctk.CTkLabel(form, text="Operator ID:").grid(row=4, column=2, sticky="w", padx=(18,8), pady=6)
+        e_op = ctk.CTkEntry(form, textvariable=v_op)
+        e_op.grid(row=4, column=3, sticky="ew", pady=6)
+
+        def save_edits():
+            sid = v_sid.get().strip()
+            if not sid:
+                messagebox.showwarning("Missing Info", "Stencil/Job Number is required.")
+                return
+            if not v_op.get().strip():
+                messagebox.showwarning("Missing Info", "Operator ID is required.")
+                e_op.focus_set(); return
+
+            if v_fab.get().strip():
+                try:
+                    datetime.strptime(v_fab.get().strip(), "%Y-%m-%d")
+                except ValueError:
+                    messagebox.showerror("Invalid Date", "Fabrication Date must be YYYY-MM-DD.")
+                    e_fab.focus_set(); return
+
+            # Get original data for logging
+            original_stencil = get_stencil(sid)
+            if not original_stencil:
+                messagebox.showerror("Error", f"Cannot load original stencil data for '{sid}'.")
+                return
+
+            stencil_data = {
+                'stencil_job_number': sid,
+                'model_name': v_model.get().strip(),
+                'pcb_part_number': v_pcb.get().strip(),
+                'product_family': v_pf.get(),
+                'quantity': v_qty.get().strip(),
+                'thickness': v_thk.get().strip(),
+                'fabrication_date': v_fab.get().strip(),
+                'status': v_status.get(),
+                'operator': v_op.get().strip(),
+                'production_line': original_stencil.get('production_line', ''),  # Keep existing line
+                'storage_row': v_storage_row.get().strip(),  # Update storage location
+                'last_updated': now_ts()
+            }
+
+            if save_stencil(stencil_data):
+                # Log the edit
+                log_activity(
+                    operator=v_op.get().strip(),
+                    action_type="EDITED",
+                    stencil_job_number=sid,
+                    from_status=original_stencil.get('status', ''),
+                    to_status=v_status.get(),
+                    storage_location=v_storage_row.get().strip(),
+                    description=f"Stencil details updated. Storage location: {v_storage_row.get().strip()}"
+                )
+
+                # 🔹 Force refresh locally
+                self._instant_local_refresh(reason="update")
+                
+                messagebox.showinfo("Success", f"Stencil '{sid}' updated successfully!")
+                popup.destroy()
+                self.refresh_main_table()
+            else:
+                messagebox.showerror("Save Failed", "Could not save stencil updates.")
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(popup)
+        btn_frame.grid(row=3, column=0, columnspan=4, sticky="ew", padx=18, pady=12)
+
+        save_btn = ctk.CTkButton(btn_frame, text="Save Changes", command=save_edits,
+                                fg_color="#27ae60", width=140, state="disabled")
+        save_btn.pack(side="right", padx=(8,0))
+        ctk.CTkButton(btn_frame, text="Cancel", command=popup.destroy,
+                     fg_color="#6c757d", width=100).pack(side="right")
+
+        popup.grid_rowconfigure(2, weight=1)
+        popup.grid_columnconfigure(0, weight=1)
+
+        e_search.focus_set()
+        e_search.bind('<Return>', lambda e: search_stencil())
+
+
+        # ------------ Scroll detection helpers ------------
+
+    def _on_main_scroll(self, event=None):
+        """Mark that user is interacting with main table so we pause auto-refresh."""
+        self.user_scrolling_main = True
+        # reset the flag 1s after last scroll / click
+        if self._main_scroll_after:
+            self.root.after_cancel(self._main_scroll_after)
+        self._main_scroll_after = self.root.after(1000, self._end_main_scroll)
+        return None  # let normal scrolling continue
+
+    def _end_main_scroll(self, event=None):
+        self.user_scrolling_main = False
+
+    def _on_live_scroll(self, event=None):
+        """Mark that user is interacting with live dashboard so we pause live refresh."""
+        self.user_scrolling_live = True
+        if self._live_scroll_after:
+            self.root.after_cancel(self._live_scroll_after)
+        self._live_scroll_after = self.root.after(1000, self._end_live_scroll)
+        return None
+
+    def _end_live_scroll(self, event=None):
+        self.user_scrolling_live = False
+
+    def open_live_view(self):
+        if self.live_window and self.live_window.winfo_exists():
+            self.live_window.lift()
+            self.live_window.focus_force()
+            return
+
+        self.live_window = ctk.CTkToplevel(self.root)
+        self.live_window.title("Live Dashboard - Stencil Management")
+        self.live_window.geometry("1400x700")
+        
+        self.live_window.transient(self.root)
+        
+        # Header
+        header = ctk.CTkFrame(self.live_window, height=60, corner_radius=0, fg_color="#2b7de9")
+        header.pack(fill="x", padx=0, pady=0)
+        
+        ctk.CTkLabel(header, text="📊 LIVE STENCIL DASHBOARD", 
+                    font=ctk.CTkFont(size=18, weight="bold"),
+                    text_color="white").pack(pady=18)
+        
+        # Refresh button
+        refresh_btn = ctk.CTkButton(header, text="🔄 Refresh", 
+                                   command=self.refresh_live_tree,
+                                   width=100, height=32,
+                                   fg_color="transparent",
+                                   hover_color="#1e6dc4",
+                                   border_width=1,
+                                   border_color="#ffffff")
+        refresh_btn.place(relx=0.95, rely=0.5, anchor="e")
+
+        # Table frame
+        table_frame = ctk.CTkFrame(self.live_window)
+        table_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Create treeview
+        columns = tuple(COLUMN_ORDER)
+        
+        # Scrollbars
+        vscroll = ttk.Scrollbar(table_frame, orient="vertical")
+        hscroll = ttk.Scrollbar(table_frame, orient="horizontal")
+
+        self.live_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            yscrollcommand=vscroll.set,
+            xscrollcommand=hscroll.set
+        )
+
+        self.live_tree.bind("<MouseWheel>", self._on_live_scroll)
+        self.live_tree.bind("<ButtonPress-1>", self._on_live_scroll)
+        self.live_tree.bind("<ButtonRelease-1>", self._end_live_scroll)
+
+
+        vscroll.config(command=self.live_tree.yview)
+        hscroll.config(command=self.live_tree.xview)
+
+        vscroll.pack(side="right", fill="y")
+        hscroll.pack(side="bottom", fill="x")
+        self.live_tree.pack(side="left", fill="both", expand=True)
+
+        # Configure columns
+        column_widths = {
+            "Model Name": 140,
+            "PCB P/N": 100,
+            "Stencil/Job Number": 150,
+            "Product Family": 100,
+            "Quantity": 80,
+            "Thickness": 80,
+            "Fabrication Date": 120,
+            "Status": 100,
+            "Operator": 100,
+            "Production_Line": 120,
+            "Storage_Row": 100,
+            "Last Updated": 160
+        }
+
+        for col in columns:
+            self.live_tree.heading(col, text=col)
+            self.live_tree.column(col, anchor="center", width=column_widths.get(col, 120))
+
+        # Initial data load
+        self.refresh_live_tree()
+        
+        def on_closing():
+            if self.live_window is not None and self.live_window.winfo_exists():
+                self.live_window.destroy()
+            self.live_window = None
+            self.live_tree = None
+            
+        self.live_window.protocol("WM_DELETE_WINDOW", on_closing)
+
+    def open_activity_log_view(self):
+        if self.activity_window and self.activity_window.winfo_exists():
+            self.activity_window.lift()
+            self.activity_window.focus_force()
+            return
+
+        self.activity_window = ctk.CTkToplevel(self.root)
+        self.activity_window.title("Activity Log - Stencil Management")
+        self.activity_window.geometry("1200x600")
+        
+        self.activity_window.transient(self.root)
+        
+        # Header
+        header = ctk.CTkFrame(self.activity_window, height=50, corner_radius=0, fg_color="#8e44ad")
+        header.pack(fill="x", padx=0, pady=0)
+        
+        ctk.CTkLabel(header, text="📝 ACTIVITY LOG", 
+                    font=ctk.CTkFont(size=16, weight="bold"),
+                    text_color="white").pack(pady=14)
+
+        # Table frame
+        table_frame = ctk.CTkFrame(self.activity_window)
+        table_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Create treeview for activity log
+        activity_columns = ["Date & Time", "Operator", "Action Type", "Stencil/Job Number", 
+                          "From_Status", "To_Status", "Production_Line", "Storage_Location", "Detailed_Description"]
+        
+        # Scrollbars
+        vscroll = ttk.Scrollbar(table_frame, orient="vertical")
+        hscroll = ttk.Scrollbar(table_frame, orient="horizontal")
+
+        self.activity_tree = ttk.Treeview(
+            table_frame,
+            columns=activity_columns,
+            show="headings",
+            selectmode="browse",
+            yscrollcommand=vscroll.set,
+            xscrollcommand=hscroll.set
+        )
+
+        vscroll.config(command=self.activity_tree.yview)
+        hscroll.config(command=self.activity_tree.xview)
+
+        vscroll.pack(side="right", fill="y")
+        hscroll.pack(side="bottom", fill="x")
+        self.activity_tree.pack(side="left", fill="both", expand=True)
+
+        # Configure columns
+        activity_widths = {
+            "Date & Time": 160,
+            "Operator": 100,
+            "Action Type": 120,
+            "Stencil/Job Number": 150,
+            "From_Status": 80,
+            "To_Status": 80,
+            "Production_Line": 120,
+            "Storage_Location": 120,
+            "Detailed_Description": 200
+        }
+
+        for col in activity_columns:
+            self.activity_tree.heading(col, text=col)
+            self.activity_tree.column(col, anchor="center", width=activity_widths.get(col, 120))
+
+        # Load activity data
+        self.refresh_activity_tree()
+        
+        def on_closing():
+            if self.activity_window is not None and self.activity_window.winfo_exists():
+                self.activity_window.destroy()
+            self.activity_window = None
+            self.activity_tree = None
+            
+        self.activity_window.protocol("WM_DELETE_WINDOW", on_closing)
+
+    def refresh_activity_tree(self):
+        if not self.activity_tree:
+            return
+        activity_df = load_activity_df().fillna("")
+        for item in self.activity_tree.get_children():
+            self.activity_tree.delete(item)
+        for _, r in activity_df.iterrows():
+            values = [r.get(col, "") for col in self.activity_tree["columns"]]
+            self.activity_tree.insert("", "end", values=values)
+
+    def exit_program(self):
+        if messagebox.askyesno("Exit", "Are you sure you want to exit the Stencil Management System?"):
+            # Close child windows first
+            if self.live_window and self.live_window.winfo_exists():
+                self.live_window.destroy()
+            if self.activity_window and self.activity_window.winfo_exists():
+                self.activity_window.destroy()
+                
+            # Then close main window
+            self.root.quit()
+            self.root.destroy()
+
+    def run(self):
+        # Start smart periodic refresh
+        self.smart_periodic_refresh()
+        # Initial data load
+        self.refresh_main_table()
+        # Initialize sync manager
+        sync_manager.last_known_timestamp = sync_manager.get_database_timestamp()
+        # Run main loop
+        self.root.mainloop()
+
+# ---------- Application Entry Point with Fast Boot ----------
+if __name__ == "__main__":
+    # Optimize startup performance
+    optimize_system_startup()
+    
+    # Initialize login database
+    init_db()
+
+    # 🔹 Check for update BEFORE showing login
+    result = check_for_update()   # no parent window needed here
+    if result == "updating":
+        # User chose to update, just exit this process
+        sys.exit(0)
+    
+    # Start with login system
+    login_app = LoginApp()
+    login_app.run()
